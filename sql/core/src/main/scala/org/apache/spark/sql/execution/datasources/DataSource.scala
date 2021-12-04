@@ -720,6 +720,7 @@ object DataSource extends Logging {
    * fallback to Data Source V1 code path.
    */
   def lookupDataSourceV2(provider: String, conf: SQLConf): Option[TableProvider] = {
+    // filter V1 source type
     val useV1Sources = conf.getConf(SQLConf.USE_V1_SOURCE_LIST).toLowerCase(Locale.ROOT)
       .split(",").map(_.trim)
     val cls = lookupDataSource(provider, conf)
