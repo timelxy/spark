@@ -651,6 +651,7 @@ object DataSource extends Logging {
     }
     val provider2 = s"$provider1.DefaultSource"
     val loader = Utils.getContextOrSparkClassLoader
+    // 没追进去细看。大概是把继承了DataSourceRegister的类全加载出来了
     val serviceLoader = ServiceLoader.load(classOf[DataSourceRegister], loader)
 
     try {
@@ -685,6 +686,7 @@ object DataSource extends Logging {
                 throw e
               }
           }
+        // head :: Nil 等于只有一个元素的List
         case head :: Nil =>
           // there is exactly one registered alias
           head.getClass
@@ -720,10 +722,12 @@ object DataSource extends Logging {
    * fallback to Data Source V1 code path.
    */
   def lookupDataSourceV2(provider: String, conf: SQLConf): Option[TableProvider] = {
-    // filter V1 source type
+    // V1 sources
     val useV1Sources = conf.getConf(SQLConf.USE_V1_SOURCE_LIST).toLowerCase(Locale.ROOT)
       .split(",").map(_.trim)
+    // 查找provider name对应的source的定义class
     val cls = lookupDataSource(provider, conf)
+    // doris的provider，应该是没直接或者间接继承TableProvider，所以这里应该是返回None
     cls.newInstance() match {
       case d: DataSourceRegister if useV1Sources.contains(d.shortName()) => None
       case t: TableProvider
