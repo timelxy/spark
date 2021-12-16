@@ -97,6 +97,7 @@ case class DataSource(
   case class SourceInfo(name: String, schema: StructType, partitionColumns: Seq[String])
 
   lazy val providingClass: Class[_] = {
+    // 这里和lookupDataSourceV2一样，都调用lookupDataSource，根据source name拿到provider class
     val cls = DataSource.lookupDataSource(className, sparkSession.sessionState.conf)
     // `providingClass` is used for resolving data source relation for catalog tables.
     // As now catalog for data source V2 is under development, here we fall back all the
@@ -347,6 +348,7 @@ case class DataSource(
       case (dataSource: SchemaRelationProvider, Some(schema)) =>
         dataSource.createRelation(sparkSession.sqlContext, caseInsensitiveOptions, schema)
       case (dataSource: RelationProvider, None) =>
+        // 就是这里，调用了doris自己实现的DorisSourceProvider中的createRelation方法
         dataSource.createRelation(sparkSession.sqlContext, caseInsensitiveOptions)
       case (_: SchemaRelationProvider, None) =>
         throw QueryCompilationErrors.schemaNotSpecifiedForSchemaRelationProviderError(className)
