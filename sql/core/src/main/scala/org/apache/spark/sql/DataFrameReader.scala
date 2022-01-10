@@ -219,7 +219,7 @@ class DataFrameReader private[sql](sparkSession: SparkSession) extends Logging {
 
     // Code path for data source v1.
     sparkSession.baseRelationToDataFrame(
-      // case class默认创建apply方法，用来construct。 这里只是显示调用了
+      // [notes] case class默认创建apply方法，用来construct。 这里只是显示调用了
       // https://docs.scala-lang.org/overviews/scala-book/case-classes.html#inner-main
       DataSource.apply(
         sparkSession,

@@ -97,7 +97,7 @@ case class DataSource(
   case class SourceInfo(name: String, schema: StructType, partitionColumns: Seq[String])
 
   lazy val providingClass: Class[_] = {
-    // 这里和lookupDataSourceV2一样，都调用lookupDataSource，根据source name拿到provider class
+    // [notes] 这里和lookupDataSourceV2一样，都调用lookupDataSource，根据source name拿到provider class
     val cls = DataSource.lookupDataSource(className, sparkSession.sessionState.conf)
     // `providingClass` is used for resolving data source relation for catalog tables.
     // As now catalog for data source V2 is under development, here we fall back all the
@@ -348,7 +348,7 @@ case class DataSource(
       case (dataSource: SchemaRelationProvider, Some(schema)) =>
         dataSource.createRelation(sparkSession.sqlContext, caseInsensitiveOptions, schema)
       case (dataSource: RelationProvider, None) =>
-        // 就是这里，调用了doris自己实现的DorisSourceProvider中的createRelation方法
+        // [notes] 就是这里，调用了doris自己实现的DorisSourceProvider中的createRelation方法
         dataSource.createRelation(sparkSession.sqlContext, caseInsensitiveOptions)
       case (_: SchemaRelationProvider, None) =>
         throw QueryCompilationErrors.schemaNotSpecifiedForSchemaRelationProviderError(className)
@@ -653,7 +653,7 @@ object DataSource extends Logging {
     }
     val provider2 = s"$provider1.DefaultSource"
     val loader = Utils.getContextOrSparkClassLoader
-    // 没追进去细看。大概是把继承了DataSourceRegister的类全加载出来了
+    // [notes] 没追进去细看。大概是把继承了DataSourceRegister的类全加载出来了
     val serviceLoader = ServiceLoader.load(classOf[DataSourceRegister], loader)
 
     try {
@@ -688,7 +688,7 @@ object DataSource extends Logging {
                 throw e
               }
           }
-        // head :: Nil 等于只有一个元素的List
+        // [notes] head :: Nil 等于只有一个元素的List
         case head :: Nil =>
           // there is exactly one registered alias
           head.getClass
@@ -724,12 +724,12 @@ object DataSource extends Logging {
    * fallback to Data Source V1 code path.
    */
   def lookupDataSourceV2(provider: String, conf: SQLConf): Option[TableProvider] = {
-    // V1 sources
+    // [notes] V1 sources
     val useV1Sources = conf.getConf(SQLConf.USE_V1_SOURCE_LIST).toLowerCase(Locale.ROOT)
       .split(",").map(_.trim)
-    // 查找provider name对应的source的定义class
+    // [notes] 查找provider name对应的source的定义class
     val cls = lookupDataSource(provider, conf)
-    // doris的provider，应该是没直接或者间接继承TableProvider，所以这里应该是返回None
+    // [notes] doris的provider，应该是没直接或者间接继承TableProvider，所以这里应该是返回None
     cls.newInstance() match {
       case d: DataSourceRegister if useV1Sources.contains(d.shortName()) => None
       case t: TableProvider
