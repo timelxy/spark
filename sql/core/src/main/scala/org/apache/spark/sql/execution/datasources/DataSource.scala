@@ -640,6 +640,7 @@ object DataSource extends Logging {
 
   /** Given a provider name, look up the data source class definition. */
   def lookupDataSource(provider: String, conf: SQLConf): Class[_] = {
+    // [notes] 获取source的正规name
     val provider1 = backwardCompatibilityMap.getOrElse(provider, provider) match {
       case name if name.equalsIgnoreCase("orc") &&
           conf.getConf(SQLConf.ORC_IMPLEMENTATION) == "native" =>
@@ -651,6 +652,7 @@ object DataSource extends Logging {
         "org.apache.spark.sql.avro.AvroFileFormat"
       case name => name
     }
+    // [notes] string interpolation：https://docs.scala-lang.org/overviews/core/string-interpolation.html
     val provider2 = s"$provider1.DefaultSource"
     val loader = Utils.getContextOrSparkClassLoader
     // [notes] 没追进去细看。大概是把继承了DataSourceRegister的类全加载出来了
