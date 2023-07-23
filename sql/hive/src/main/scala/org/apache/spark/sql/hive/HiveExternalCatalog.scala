@@ -40,13 +40,15 @@ import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils._
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, CharVarcharUtils}
+import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
 import org.apache.spark.sql.execution.command.DDLUtils
 import org.apache.spark.sql.execution.datasources.{PartitioningUtils, SourceOptions}
 import org.apache.spark.sql.hive.client.HiveClient
 import org.apache.spark.sql.internal.HiveSerDe
 import org.apache.spark.sql.internal.StaticSQLConf._
-import org.apache.spark.sql.types.{AnsiIntervalType, ArrayType, DataType, MapType, StructType}
+import org.apache.spark.sql.types.{AnsiIntervalType, ArrayType, DataType, MapType, StructType, TimestampNTZType}
 
 /**
  * A persistent implementation of the system catalog using Hive.
@@ -58,10 +60,6 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
   import CatalogTypes.TablePartitionSpec
   import HiveExternalCatalog._
   import CatalogTableType._
-
-  // SPARK-32256: Make sure `VersionInfo` is initialized before touching the isolated classloader.
-  // This is to ensure Hive can get the Hadoop version when using the isolated classloader.
-  org.apache.hadoop.util.VersionInfo.getVersion()
 
   /**
    * A Hive client used to interact with the metastore.
@@ -159,10 +157,13 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
           case st: StructType => verifyNestedColumnNames(st)
           case _ if invalidChars.exists(f.name.contains) =>
             val invalidCharsString = invalidChars.map(c => s"'$c'").mkString(", ")
-            val errMsg = "Cannot create a table having a nested column whose name contains " +
-              s"invalid characters ($invalidCharsString) in Hive metastore. Table: $tableName; " +
-              s"Column: ${f.name}"
-            throw new AnalysisException(errMsg)
+            throw new AnalysisException(
+              errorClass = "INVALID_HIVE_COLUMN_NAME",
+              messageParameters = Map(
+                "invalidChars" -> invalidCharsString,
+                "tableName" -> toSQLId(tableName.nameParts),
+                "columnName" -> toSQLId(f.name)
+              ))
           case _ =>
         }
       }
@@ -283,7 +284,17 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
         // about not case preserving and make Hive serde table and view support mixed-case column
         // names.
         properties = tableDefinition.properties ++ tableMetaToTableProps(tableDefinition))
-      client.createTable(tableWithDataSourceProps, ignoreIfExists)
+      try {
+        client.createTable(tableWithDataSourceProps, ignoreIfExists)
+      } catch {
+        case NonFatal(e) if (tableDefinition.tableType == CatalogTableType.VIEW) =>
+          // If for some reason we fail to store the schema we store it as empty there
+          // since we already store the real schema in the table properties. This try-catch
+          // should only be necessary for Spark views which are incompatible with Hive
+          client.createTable(
+            tableWithDataSourceProps.copy(schema = EMPTY_DATA_SCHEMA),
+            ignoreIfExists)
+      }
     }
   }
 
@@ -710,19 +721,16 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
       table: String,
       stats: Option[CatalogStatistics]): Unit = withClient {
     requireTableExists(db, table)
-    val rawTable = getRawTable(db, table)
-
-    // convert table statistics to properties so that we can persist them through hive client
-    val statsProperties =
+    val rawHiveTable = client.getRawHiveTable(db, table)
+    val oldProps = rawHiveTable.hiveTableProps().filterNot(_._1.startsWith(STATISTICS_PREFIX))
+    val newProps =
       if (stats.isDefined) {
-        statsToProperties(stats.get)
+        oldProps ++ statsToProperties(stats.get)
       } else {
-        new mutable.HashMap[String, String]()
+        oldProps
       }
 
-    val oldTableNonStatsProps = rawTable.properties.filterNot(_._1.startsWith(STATISTICS_PREFIX))
-    val updatedTable = rawTable.copy(properties = oldTableNonStatsProps ++ statsProperties)
-    client.alterTable(updatedTable)
+    client.alterTableProps(rawHiveTable, newProps)
   }
 
   override def getTable(db: String, table: String): CatalogTable = withClient {
@@ -768,8 +776,7 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
     val version: String = table.properties.getOrElse(CREATED_SPARK_VERSION, "2.2 or prior")
 
     // Restore Spark's statistics from information in Metastore.
-    val restoredStats =
-      statsFromProperties(table.properties, table.identifier.table, table.schema)
+    val restoredStats = statsFromProperties(table.properties, table.identifier.table)
     if (restoredStats.isDefined) {
       table = table.copy(stats = restoredStats)
     }
@@ -808,7 +815,7 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
       val partColumnNames = getPartitionColumnsFromTableProperties(table)
       val reorderedSchema = reorderSchema(schema = schemaFromTableProps, partColumnNames)
 
-      if (DataType.equalsIgnoreCaseAndNullability(reorderedSchema, table.schema) ||
+      if (DataTypeUtils.equalsIgnoreCaseAndNullability(reorderedSchema, table.schema) ||
           options.respectSparkSchema) {
         hiveTable.copy(
           schema = reorderedSchema,
@@ -1137,8 +1144,7 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
 
   private def statsFromProperties(
       properties: Map[String, String],
-      table: String,
-      schema: StructType): Option[CatalogStatistics] = {
+      table: String): Option[CatalogStatistics] = {
 
     val statsProps = properties.filterKeys(_.startsWith(STATISTICS_PREFIX))
     if (statsProps.isEmpty) {
@@ -1208,8 +1214,7 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
 
     // Restore Spark's statistics from information in Metastore.
     // Note: partition-level statistics were introduced in 2.3.
-    val restoredStats =
-      statsFromProperties(partition.parameters, table.identifier.table, table.schema)
+    val restoredStats = statsFromProperties(partition.parameters, table.identifier.table)
     if (restoredStats.isDefined) {
       partition.copy(
         spec = restoredSpec,
@@ -1273,7 +1278,7 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
       // treats dot as matching any single character and may return more partitions than we
       // expected. Here we do an extra filter to drop unexpected partitions.
       case Some(spec) if spec.exists(_._2.contains(".")) =>
-        res.filter(p => isPartialPartitionSpec(spec, p.spec))
+        res.filter(p => isPartialPartitionSpec(spec, toMetaStorePartitionSpec(p.spec)))
       case _ => res
     }
   }
@@ -1283,11 +1288,11 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
       table: String,
       predicates: Seq[Expression],
       defaultTimeZoneId: String): Seq[CatalogTablePartition] = withClient {
-    val rawTable = getRawTable(db, table)
-    val catalogTable = restoreTableMetadata(rawTable)
+    val rawHiveTable = client.getRawHiveTable(db, table)
+    val catalogTable = restoreTableMetadata(rawHiveTable.toCatalogTable)
     val partColNameMap = buildLowerCasePartColNameMap(catalogTable)
     val clientPrunedPartitions =
-      client.getPartitionsByFilter(rawTable, predicates).map { part =>
+      client.getPartitionsByFilter(rawHiveTable, predicates).map { part =>
         part.copy(spec = restorePartitionSpec(part.spec, partColNameMap))
       }
     prunePartitionsByFilter(catalogTable, clientPrunedPartitions, predicates, defaultTimeZoneId)
@@ -1428,6 +1433,7 @@ object HiveExternalCatalog {
 
   private[spark] def isHiveCompatibleDataType(dt: DataType): Boolean = dt match {
     case _: AnsiIntervalType => false
+    case _: TimestampNTZType => false
     case s: StructType => s.forall(f => isHiveCompatibleDataType(f.dataType))
     case a: ArrayType => isHiveCompatibleDataType(a.elementType)
     case m: MapType =>

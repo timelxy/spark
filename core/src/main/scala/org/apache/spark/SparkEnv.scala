@@ -32,6 +32,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.api.python.PythonWorkerFactory
 import org.apache.spark.broadcast.BroadcastManager
+import org.apache.spark.executor.ExecutorBackend
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.internal.config._
 import org.apache.spark.memory.{MemoryManager, UnifiedMemoryManager}
@@ -72,14 +73,26 @@ class SparkEnv (
     val conf: SparkConf) extends Logging {
 
   @volatile private[spark] var isStopped = false
-  private val pythonWorkers = mutable.HashMap[(String, Map[String, String]), PythonWorkerFactory]()
+
+  /**
+   * A key for PythonWorkerFactory cache.
+   * @param pythonExec The python executable to run the Python worker.
+   * @param workerModule The worker module to be called in the worker, e.g., "pyspark.worker".
+   * @param daemonModule The daemon module name to reuse the worker, e.g., "pyspark.daemon".
+   * @param envVars The environment variables for the worker.
+   */
+  private case class PythonWorkersKey(
+      pythonExec: String, workerModule: String, daemonModule: String, envVars: Map[String, String])
+  private val pythonWorkers = mutable.HashMap[PythonWorkersKey, PythonWorkerFactory]()
 
   // A general, soft-reference map for metadata needed during HadoopRDD split computation
   // (e.g., HadoopFileRDD uses this to cache JobConfs and InputFormats).
   private[spark] val hadoopJobMetadata =
-    CacheBuilder.newBuilder().softValues().build[String, AnyRef]().asMap()
+    CacheBuilder.newBuilder().maximumSize(1000).softValues().build[String, AnyRef]().asMap()
 
   private[spark] var driverTmpDir: Option[String] = None
+
+  private[spark] var executorBackend: Option[ExecutorBackend] = None
 
   private[spark] def stop(): Unit = {
 
@@ -112,32 +125,66 @@ class SparkEnv (
     }
   }
 
-  private[spark]
-  def createPythonWorker(
+  private[spark] def createPythonWorker(
       pythonExec: String,
+      workerModule: String,
+      daemonModule: String,
       envVars: Map[String, String]): (java.net.Socket, Option[Int]) = {
     synchronized {
-      val key = (pythonExec, envVars)
-      pythonWorkers.getOrElseUpdate(key, new PythonWorkerFactory(pythonExec, envVars)).create()
+      val key = PythonWorkersKey(pythonExec, workerModule, daemonModule, envVars)
+      pythonWorkers.getOrElseUpdate(key,
+        new PythonWorkerFactory(pythonExec, workerModule, daemonModule, envVars)).create()
     }
   }
 
-  private[spark]
-  def destroyPythonWorker(pythonExec: String,
-      envVars: Map[String, String], worker: Socket): Unit = {
+  private[spark] def createPythonWorker(
+      pythonExec: String,
+      workerModule: String,
+      envVars: Map[String, String]): (java.net.Socket, Option[Int]) = {
+    createPythonWorker(
+      pythonExec, workerModule, PythonWorkerFactory.defaultDaemonModule, envVars)
+  }
+
+  private[spark] def destroyPythonWorker(
+      pythonExec: String,
+      workerModule: String,
+      daemonModule: String,
+      envVars: Map[String, String],
+      worker: Socket): Unit = {
     synchronized {
-      val key = (pythonExec, envVars)
+      val key = PythonWorkersKey(pythonExec, workerModule, daemonModule, envVars)
       pythonWorkers.get(key).foreach(_.stopWorker(worker))
     }
   }
 
-  private[spark]
-  def releasePythonWorker(pythonExec: String,
-      envVars: Map[String, String], worker: Socket): Unit = {
+  private[spark] def destroyPythonWorker(
+      pythonExec: String,
+      workerModule: String,
+      envVars: Map[String, String],
+      worker: Socket): Unit = {
+    destroyPythonWorker(
+      pythonExec, workerModule, PythonWorkerFactory.defaultDaemonModule, envVars, worker)
+  }
+
+  private[spark] def releasePythonWorker(
+      pythonExec: String,
+      workerModule: String,
+      daemonModule: String,
+      envVars: Map[String, String],
+      worker: Socket): Unit = {
     synchronized {
-      val key = (pythonExec, envVars)
+      val key = PythonWorkersKey(pythonExec, workerModule, daemonModule, envVars)
       pythonWorkers.get(key).foreach(_.releaseWorker(worker))
     }
+  }
+
+  private[spark] def releasePythonWorker(
+      pythonExec: String,
+      workerModule: String,
+      envVars: Map[String, String],
+      worker: Socket): Unit = {
+    releasePythonWorker(
+      pythonExec, workerModule, PythonWorkerFactory.defaultDaemonModule, envVars, worker)
   }
 }
 
@@ -166,6 +213,7 @@ object SparkEnv extends Logging {
       isLocal: Boolean,
       listenerBus: LiveListenerBus,
       numCores: Int,
+      sparkContext: SparkContext,
       mockOutputCommitCoordinator: Option[OutputCommitCoordinator] = None): SparkEnv = {
     assert(conf.contains(DRIVER_HOST_ADDRESS),
       s"${DRIVER_HOST_ADDRESS.key} is not set on the driver!")
@@ -188,6 +236,7 @@ object SparkEnv extends Logging {
       numCores,
       ioEncryptionKey,
       listenerBus = listenerBus,
+      Option(sparkContext),
       mockOutputCommitCoordinator = mockOutputCommitCoordinator
     )
   }
@@ -232,6 +281,7 @@ object SparkEnv extends Logging {
   /**
    * Helper method to create a SparkEnv for a driver or an executor.
    */
+  // scalastyle:off argcount
   private def create(
       conf: SparkConf,
       executorId: String,
@@ -242,7 +292,9 @@ object SparkEnv extends Logging {
       numUsableCores: Int,
       ioEncryptionKey: Option[Array[Byte]],
       listenerBus: LiveListenerBus = null,
+      sc: Option[SparkContext] = None,
       mockOutputCommitCoordinator: Option[OutputCommitCoordinator] = None): SparkEnv = {
+    // scalastyle:on argcount
 
     val isDriver = executorId == SparkContext.DRIVER_IDENTIFIER
 
@@ -340,12 +392,14 @@ object SparkEnv extends Logging {
           isLocal,
           conf,
           listenerBus,
-          if (conf.get(config.SHUFFLE_SERVICE_FETCH_RDD_ENABLED)) {
+          if (conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
             externalShuffleClient
           } else {
             None
           }, blockManagerInfo,
-          mapOutputTracker.asInstanceOf[MapOutputTrackerMaster], isDriver)),
+          mapOutputTracker.asInstanceOf[MapOutputTrackerMaster],
+          shuffleManager,
+          isDriver)),
       registerOrLookupEndpoint(
         BlockManagerMaster.DRIVER_HEARTBEAT_ENDPOINT_NAME,
         new BlockManagerMasterHeartbeatEndpoint(rpcEnv, isLocal, blockManagerInfo)),
@@ -353,8 +407,8 @@ object SparkEnv extends Logging {
       isDriver)
 
     val blockTransferService =
-      new NettyBlockTransferService(conf, securityManager, bindAddress, advertiseAddress,
-        blockManagerPort, numUsableCores, blockManagerMaster.driverEndpoint)
+      new NettyBlockTransferService(conf, securityManager, serializerManager, bindAddress,
+        advertiseAddress, blockManagerPort, numUsableCores, blockManagerMaster.driverEndpoint)
 
     // NB: blockManager is not valid until initialize() is called later.
     val blockManager = new BlockManager(
@@ -386,7 +440,12 @@ object SparkEnv extends Logging {
     }
 
     val outputCommitCoordinator = mockOutputCommitCoordinator.getOrElse {
-      new OutputCommitCoordinator(conf, isDriver)
+      if (isDriver) {
+        new OutputCommitCoordinator(conf, isDriver, sc)
+      } else {
+        new OutputCommitCoordinator(conf, isDriver)
+      }
+
     }
     val outputCommitCoordinatorRef = registerOrLookupEndpoint("OutputCommitCoordinator",
       new OutputCommitCoordinatorEndpoint(rpcEnv, outputCommitCoordinator))
@@ -424,14 +483,14 @@ object SparkEnv extends Logging {
    * class paths. Map keys define the category, and map values represent the corresponding
    * attributes as a sequence of KV pairs. This is used mainly for SparkListenerEnvironmentUpdate.
    */
-  private[spark]
-  def environmentDetails(
+  private[spark] def environmentDetails(
       conf: SparkConf,
       hadoopConf: Configuration,
       schedulingMode: String,
       addedJars: Seq[String],
       addedFiles: Seq[String],
-      addedArchives: Seq[String]): Map[String, Seq[(String, String)]] = {
+      addedArchives: Seq[String],
+      metricsProperties: Map[String, String]): Map[String, Seq[(String, String)]] = {
 
     import Properties._
     val jvmInformation = Seq(
@@ -473,6 +532,7 @@ object SparkEnv extends Logging {
       "Spark Properties" -> sparkProperties,
       "Hadoop Properties" -> hadoopProperties,
       "System Properties" -> otherProperties,
-      "Classpath Entries" -> classPaths)
+      "Classpath Entries" -> classPaths,
+      "Metrics Properties" -> metricsProperties.toSeq.sorted)
   }
 }

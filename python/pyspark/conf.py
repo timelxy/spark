@@ -20,10 +20,11 @@ __all__ = ["SparkConf"]
 import sys
 from typing import Dict, List, Optional, Tuple, cast, overload
 
-from py4j.java_gateway import JVMView, JavaObject  # type: ignore[import]
+from py4j.java_gateway import JVMView, JavaObject
+from pyspark.errors import PySparkRuntimeError
 
 
-class SparkConf(object):
+class SparkConf:
     """
     Configuration for a Spark application. Used to set various Spark
     parameters as key-value pairs.
@@ -124,7 +125,7 @@ class SparkConf(object):
         else:
             from pyspark.context import SparkContext
 
-            _jvm = _jvm or SparkContext._jvm  # type: ignore[attr-defined]
+            _jvm = _jvm or SparkContext._jvm
 
             if _jvm is not None:
                 # JVM is created, so create self._jconf directly through JVM
@@ -182,7 +183,10 @@ class SparkConf(object):
     ) -> "SparkConf":
         """Set an environment variable to be passed to executors."""
         if (key is not None and pairs is not None) or (key is None and pairs is None):
-            raise RuntimeError("Either pass one key-value pair or a list of pairs")
+            raise PySparkRuntimeError(
+                error_class="KEY_VALUE_PAIR_REQUIRED",
+                message_parameters={},
+            )
         elif key is not None:
             self.set("spark.executorEnv.{}".format(key), cast(str, value))
         elif pairs is not None:
@@ -202,6 +206,18 @@ class SparkConf(object):
         for (k, v) in pairs:
             self.set(k, v)
         return self
+
+    @overload
+    def get(self, key: str) -> Optional[str]:
+        ...
+
+    @overload
+    def get(self, key: str, defaultValue: None) -> Optional[str]:
+        ...
+
+    @overload
+    def get(self, key: str, defaultValue: str) -> str:
+        ...
 
     def get(self, key: str, defaultValue: Optional[str] = None) -> Optional[str]:
         """Get the configured value for some key, or return a default otherwise."""

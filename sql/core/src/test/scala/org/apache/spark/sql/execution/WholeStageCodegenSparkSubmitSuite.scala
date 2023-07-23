@@ -27,10 +27,12 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{QueryTest, Row, SparkSession}
 import org.apache.spark.sql.functions.{array, col, count, lit}
 import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.tags.ExtendedSQLTest
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.util.ResetSystemProperties
 
 // Due to the need to set driver's extraJavaOptions, this test needs to use actual SparkSubmit.
+@ExtendedSQLTest
 class WholeStageCodegenSparkSubmitSuite extends SparkSubmitTestUtils
   with Matchers
   with BeforeAndAfterEach
@@ -71,7 +73,7 @@ object WholeStageCodegenSparkSubmitSuite extends Assertions with Logging {
   var spark: SparkSession = _
 
   def main(args: Array[String]): Unit = {
-    TestUtils.configTestLog4j("INFO")
+    TestUtils.configTestLog4j2("INFO")
 
     spark = SparkSession.builder().getOrCreate()
 
@@ -84,7 +86,7 @@ object WholeStageCodegenSparkSubmitSuite extends Assertions with Logging {
     val df = spark.range(71773).select((col("id") % lit(10)).cast(IntegerType) as "v")
       .groupBy(array(col("v"))).agg(count(col("*")))
     val plan = df.queryExecution.executedPlan
-    assert(plan.find(_.isInstanceOf[WholeStageCodegenExec]).isDefined)
+    assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]))
 
     val expectedAnswer =
       Row(Array(0), 7178) ::

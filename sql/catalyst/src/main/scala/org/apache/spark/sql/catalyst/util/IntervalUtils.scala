@@ -28,7 +28,6 @@ import scala.util.control.NonFatal
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
-import org.apache.spark.sql.catalyst.util.DateTimeUtils.millisToMicros
 import org.apache.spark.sql.catalyst.util.IntervalStringStyles.{ANSI_STYLE, HIVE_STYLE, IntervalStyle}
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.internal.SQLConf
@@ -44,7 +43,7 @@ object IntervalStringStyles extends Enumeration {
   val ANSI_STYLE, HIVE_STYLE = Value
 }
 
-object IntervalUtils {
+object IntervalUtils extends SparkIntervalUtils {
 
   private val MAX_DAY = Long.MaxValue / MICROS_PER_DAY
   private val MAX_HOUR = Long.MaxValue / MICROS_PER_HOUR
@@ -381,7 +380,7 @@ object IntervalUtils {
     micros = Math.addExact(micros, sign * hours * MICROS_PER_HOUR)
     val minutes = toLongWithRange(minuteStr, minute, 0, 59)
     micros = Math.addExact(micros, sign * minutes * MICROS_PER_MINUTE)
-    micros = Math.addExact(micros, sign * parseSecondNano(second))
+    micros = Math.addExact(micros, sign * parseSecondNano(second, 0, 59))
     micros
   }
 
@@ -391,7 +390,7 @@ object IntervalUtils {
     micros = Math.addExact(micros, sign * hours * MICROS_PER_HOUR)
     val minutes = toLongWithRange(minuteStr, minute, 0, 59)
     micros = Math.addExact(micros, sign * minutes * MICROS_PER_MINUTE)
-    micros = Math.addExact(micros, sign * parseSecondNano(second))
+    micros = Math.addExact(micros, sign * parseSecondNano(second, 0, 59))
     micros
   }
 
@@ -399,7 +398,7 @@ object IntervalUtils {
     var micros = 0L
     val minutes = toLongWithRange(minuteStr, minute, 0, MAX_MINUTE)
     micros = Math.addExact(micros, sign * minutes * MICROS_PER_MINUTE)
-    micros = Math.addExact(micros, sign * parseSecondNano(second))
+    micros = Math.addExact(micros, sign * parseSecondNano(second, 0, 59))
     micros
   }
 
@@ -549,9 +548,12 @@ object IntervalUtils {
   /**
    * Parse second_nano string in ss.nnnnnnnnn format to microseconds
    */
-  private def parseSecondNano(secondNano: String): Long = {
+  private def parseSecondNano(
+      secondNano: String,
+      minSecond: Long = MIN_SECOND,
+      maxSecond: Long = MAX_SECOND): Long = {
     def parseSeconds(secondsStr: String): Long = {
-      toLongWithRange(secondStr, secondsStr, MIN_SECOND, MAX_SECOND) * MICROS_PER_SECOND
+      toLongWithRange(secondStr, secondsStr, minSecond, maxSecond) * MICROS_PER_SECOND
     }
 
     secondNano.split("\\.") match {
@@ -733,7 +735,7 @@ object IntervalUtils {
    * @throws ArithmeticException if the result overflows any field value or divided by zero
    */
   def divideExact(interval: CalendarInterval, num: Double): CalendarInterval = {
-    if (num == 0) throw QueryExecutionErrors.divideByZeroError()
+    if (num == 0) throw QueryExecutionErrors.intervalDividedByZeroError(null)
     fromDoubles(interval.months / num, interval.days / num, interval.microseconds / num)
   }
 
@@ -751,20 +753,6 @@ object IntervalUtils {
         UNIT_SUFFIX,
         UNIT_END = Value
   }
-  private final val intervalStr = unitToUtf8("interval")
-  private def unitToUtf8(unit: String): UTF8String = {
-    UTF8String.fromString(unit)
-  }
-  private final val yearStr = unitToUtf8("year")
-  private final val monthStr = unitToUtf8("month")
-  private final val weekStr = unitToUtf8("week")
-  private final val dayStr = unitToUtf8("day")
-  private final val hourStr = unitToUtf8("hour")
-  private final val minuteStr = unitToUtf8("minute")
-  private final val secondStr = unitToUtf8("second")
-  private final val millisStr = unitToUtf8("millisecond")
-  private final val microsStr = unitToUtf8("microsecond")
-  private final val nanosStr = unitToUtf8("nanosecond")
 
   /**
    * A safe version of `stringToInterval`. It returns null for invalid input string.
@@ -775,212 +763,6 @@ object IntervalUtils {
     } catch {
       case _: IllegalArgumentException => null
     }
-  }
-
-  /**
-   * Converts a string to [[CalendarInterval]] case-insensitively.
-   *
-   * @throws IllegalArgumentException if the input string is not in valid interval format.
-   */
-  def stringToInterval(input: UTF8String): CalendarInterval = {
-    import ParseState._
-    def throwIAE(msg: String, e: Exception = null) = {
-      throw new IllegalArgumentException(s"Error parsing '$input' to interval, $msg", e)
-    }
-
-    if (input == null) {
-      throwIAE("interval string cannot be null")
-    }
-    // scalastyle:off caselocale .toLowerCase
-    val s = input.trimAll().toLowerCase
-    // scalastyle:on
-    val bytes = s.getBytes
-    if (bytes.isEmpty) {
-      throwIAE("interval string cannot be empty")
-    }
-    var state = PREFIX
-    var i = 0
-    var currentValue: Long = 0
-    var isNegative: Boolean = false
-    var months: Int = 0
-    var days: Int = 0
-    var microseconds: Long = 0
-    var fractionScale: Int = 0
-    val initialFractionScale = (NANOS_PER_SECOND / 10).toInt
-    var fraction: Int = 0
-    var pointPrefixed: Boolean = false
-
-    def trimToNextState(b: Byte, next: ParseState): Unit = {
-      if (Character.isWhitespace(b)) {
-        i += 1
-      } else {
-        state = next
-      }
-    }
-
-    def currentWord: String = {
-      val sep = "\\s+"
-      val strings = s.toString.split(sep)
-      val lenRight = s.substring(i, s.numBytes()).toString.split(sep).length
-      strings(strings.length - lenRight)
-    }
-
-    while (i < bytes.length) {
-      val b = bytes(i)
-      state match {
-        case PREFIX =>
-          if (s.startsWith(intervalStr)) {
-            if (s.numBytes() == intervalStr.numBytes()) {
-              throwIAE("interval string cannot be empty")
-            } else if (!Character.isWhitespace(bytes(i + intervalStr.numBytes()))) {
-              throwIAE(s"invalid interval prefix $currentWord")
-            } else {
-              i += intervalStr.numBytes() + 1
-            }
-          }
-          state = TRIM_BEFORE_SIGN
-        case TRIM_BEFORE_SIGN => trimToNextState(b, SIGN)
-        case SIGN =>
-          currentValue = 0
-          fraction = 0
-          // We preset next state from SIGN to TRIM_BEFORE_VALUE. If we meet '.' in the SIGN state,
-          // it means that the interval value we deal with here is a numeric with only fractional
-          // part, such as '.11 second', which can be parsed to 0.11 seconds. In this case, we need
-          // to reset next state to `VALUE_FRACTIONAL_PART` to go parse the fraction part of the
-          // interval value.
-          state = TRIM_BEFORE_VALUE
-          // We preset the scale to an invalid value to track fraction presence in the UNIT_BEGIN
-          // state. If we meet '.', the scale become valid for the VALUE_FRACTIONAL_PART state.
-          fractionScale = -1
-          pointPrefixed = false
-          b match {
-            case '-' =>
-              isNegative = true
-              i += 1
-            case '+' =>
-              isNegative = false
-              i += 1
-            case _ if '0' <= b && b <= '9' =>
-              isNegative = false
-            case '.' =>
-              isNegative = false
-              fractionScale = initialFractionScale
-              pointPrefixed = true
-              i += 1
-              state = VALUE_FRACTIONAL_PART
-            case _ => throwIAE( s"unrecognized number '$currentWord'")
-          }
-        case TRIM_BEFORE_VALUE => trimToNextState(b, VALUE)
-        case VALUE =>
-          b match {
-            case _ if '0' <= b && b <= '9' =>
-              try {
-                currentValue = Math.addExact(Math.multiplyExact(10, currentValue), (b - '0'))
-              } catch {
-                case e: ArithmeticException => throwIAE(e.getMessage, e)
-              }
-            case _ if Character.isWhitespace(b) => state = TRIM_BEFORE_UNIT
-            case '.' =>
-              fractionScale = initialFractionScale
-              state = VALUE_FRACTIONAL_PART
-            case _ => throwIAE(s"invalid value '$currentWord'")
-          }
-          i += 1
-        case VALUE_FRACTIONAL_PART =>
-          if ('0' <= b && b <= '9' && fractionScale > 0) {
-            fraction += (b - '0') * fractionScale
-            fractionScale /= 10
-          } else if (Character.isWhitespace(b) &&
-              (!pointPrefixed || fractionScale < initialFractionScale)) {
-            fraction /= NANOS_PER_MICROS.toInt
-            state = TRIM_BEFORE_UNIT
-          } else if ('0' <= b && b <= '9') {
-            throwIAE(s"interval can only support nanosecond precision, '$currentWord' is out" +
-              s" of range")
-          } else {
-            throwIAE(s"invalid value '$currentWord'")
-          }
-          i += 1
-        case TRIM_BEFORE_UNIT => trimToNextState(b, UNIT_BEGIN)
-        case UNIT_BEGIN =>
-          // Checks that only seconds can have the fractional part
-          if (b != 's' && fractionScale >= 0) {
-            throwIAE(s"'$currentWord' cannot have fractional part")
-          }
-          if (isNegative) {
-            currentValue = -currentValue
-            fraction = -fraction
-          }
-          try {
-            b match {
-              case 'y' if s.matchAt(yearStr, i) =>
-                val monthsInYears = Math.multiplyExact(MONTHS_PER_YEAR, currentValue)
-                months = Math.toIntExact(Math.addExact(months, monthsInYears))
-                i += yearStr.numBytes()
-              case 'w' if s.matchAt(weekStr, i) =>
-                val daysInWeeks = Math.multiplyExact(DAYS_PER_WEEK, currentValue)
-                days = Math.toIntExact(Math.addExact(days, daysInWeeks))
-                i += weekStr.numBytes()
-              case 'd' if s.matchAt(dayStr, i) =>
-                days = Math.addExact(days, Math.toIntExact(currentValue))
-                i += dayStr.numBytes()
-              case 'h' if s.matchAt(hourStr, i) =>
-                val hoursUs = Math.multiplyExact(currentValue, MICROS_PER_HOUR)
-                microseconds = Math.addExact(microseconds, hoursUs)
-                i += hourStr.numBytes()
-              case 's' if s.matchAt(secondStr, i) =>
-                val secondsUs = Math.multiplyExact(currentValue, MICROS_PER_SECOND)
-                microseconds = Math.addExact(Math.addExact(microseconds, secondsUs), fraction)
-                i += secondStr.numBytes()
-              case 'm' =>
-                if (s.matchAt(monthStr, i)) {
-                  months = Math.addExact(months, Math.toIntExact(currentValue))
-                  i += monthStr.numBytes()
-                } else if (s.matchAt(minuteStr, i)) {
-                  val minutesUs = Math.multiplyExact(currentValue, MICROS_PER_MINUTE)
-                  microseconds = Math.addExact(microseconds, minutesUs)
-                  i += minuteStr.numBytes()
-                } else if (s.matchAt(millisStr, i)) {
-                  val millisUs = millisToMicros(currentValue)
-                  microseconds = Math.addExact(microseconds, millisUs)
-                  i += millisStr.numBytes()
-                } else if (s.matchAt(microsStr, i)) {
-                  microseconds = Math.addExact(microseconds, currentValue)
-                  i += microsStr.numBytes()
-                } else throwIAE(s"invalid unit '$currentWord'")
-              case _ => throwIAE(s"invalid unit '$currentWord'")
-            }
-          } catch {
-            case e: ArithmeticException => throwIAE(e.getMessage, e)
-          }
-          state = UNIT_SUFFIX
-        case UNIT_SUFFIX =>
-          b match {
-            case 's' => state = UNIT_END
-            case _ if Character.isWhitespace(b) => state = TRIM_BEFORE_SIGN
-            case _ => throwIAE(s"invalid unit '$currentWord'")
-          }
-          i += 1
-        case UNIT_END =>
-          if (Character.isWhitespace(b) ) {
-            i += 1
-            state = TRIM_BEFORE_SIGN
-          } else {
-            throwIAE(s"invalid unit '$currentWord'")
-          }
-      }
-    }
-
-    val result = state match {
-      case UNIT_SUFFIX | UNIT_END | TRIM_BEFORE_SIGN =>
-        new CalendarInterval(months, days, microseconds)
-      case TRIM_BEFORE_VALUE => throwIAE(s"expect a number after '$currentWord' but hit EOL")
-      case VALUE | VALUE_FRACTIONAL_PART =>
-        throwIAE(s"expect a unit name after '$currentWord' but hit EOL")
-      case _ => throwIAE(s"unknown error when parsing '$currentWord'")
-    }
-
-    result
   }
 
   def makeInterval(
@@ -1160,8 +942,10 @@ object IntervalUtils {
       endField: Byte): String = {
     var sign = ""
     var rest = micros
+    // scalastyle:off caselocale
     val from = DT.fieldToString(startField).toUpperCase
     val to = DT.fieldToString(endField).toUpperCase
+    // scalastyle:on caselocale
     val prefix = "INTERVAL '"
     val postfix = s"' ${if (startField == endField) from else s"$from TO $to"}"
 
@@ -1256,25 +1040,45 @@ object IntervalUtils {
     intervalString
   }
 
-  def intToYearMonthInterval(v: Int, endField: Byte): Int = {
+  def intToYearMonthInterval(v: Int, startField: Byte, endField: Byte): Int = {
     endField match {
       case YEAR =>
         try {
           Math.multiplyExact(v, MONTHS_PER_YEAR)
         } catch {
           case _: ArithmeticException =>
-            throw QueryExecutionErrors.castingCauseOverflowError(v, YM(endField).catalogString)
+            throw QueryExecutionErrors.castingCauseOverflowError(
+              v,
+              IntegerType,
+              YearMonthIntervalType(startField, endField))
         }
       case MONTH => v
     }
   }
 
-  def longToYearMonthInterval(v: Long, endField: Byte): Int = {
+  def longToYearMonthInterval(v: Long, startField: Byte, endField: Byte): Int = {
     val vInt = v.toInt
     if (v != vInt) {
-      throw QueryExecutionErrors.castingCauseOverflowError(v, YM(endField).catalogString)
+      throw QueryExecutionErrors.castingCauseOverflowError(
+        v,
+        LongType,
+        YearMonthIntervalType(startField, endField))
     }
-    intToYearMonthInterval(vInt, endField)
+    intToYearMonthInterval(vInt, startField, endField)
+  }
+
+  def decimalToYearMonthInterval(
+      d: Decimal, p: Int, s: Int, startField: Byte, endField: Byte): Int = {
+    try {
+      val months = if (endField == YEAR) d.toBigDecimal * MONTHS_PER_YEAR else d.toBigDecimal
+      months.setScale(0, BigDecimal.RoundingMode.HALF_UP).toIntExact
+    } catch {
+      case _: ArithmeticException =>
+        throw QueryExecutionErrors.castingCauseOverflowError(
+          d,
+          DecimalType(p, s),
+          YearMonthIntervalType(startField, endField))
+    }
   }
 
   def yearMonthIntervalToInt(v: Int, startField: Byte, endField: Byte): Int = {
@@ -1289,7 +1093,9 @@ object IntervalUtils {
     val vShort = vInt.toShort
     if (vInt != vShort) {
       throw QueryExecutionErrors.castingCauseOverflowError(
-        toYearMonthIntervalString(v, ANSI_STYLE, startField, endField), ShortType.catalogString)
+        v,
+        YearMonthIntervalType(startField, endField),
+        ShortType)
     }
     vShort
   }
@@ -1299,19 +1105,24 @@ object IntervalUtils {
     val vByte = vInt.toByte
     if (vInt != vByte) {
       throw QueryExecutionErrors.castingCauseOverflowError(
-        toYearMonthIntervalString(v, ANSI_STYLE, startField, endField), ByteType.catalogString)
+        v,
+        YearMonthIntervalType(startField, endField),
+        ByteType)
     }
     vByte
   }
 
-  def intToDayTimeInterval(v: Int, endField: Byte): Long = {
+  def intToDayTimeInterval(v: Int, startField: Byte, endField: Byte): Long = {
     endField match {
       case DAY =>
         try {
           Math.multiplyExact(v, MICROS_PER_DAY)
         } catch {
           case _: ArithmeticException =>
-            throw QueryExecutionErrors.castingCauseOverflowError(v, DT(endField).catalogString)
+            throw QueryExecutionErrors.castingCauseOverflowError(
+              v,
+              IntegerType,
+              DayTimeIntervalType(startField, endField))
         }
       case HOUR => v * MICROS_PER_HOUR
       case MINUTE => v * MICROS_PER_MINUTE
@@ -1319,7 +1130,7 @@ object IntervalUtils {
     }
   }
 
-  def longToDayTimeInterval(v: Long, endField: Byte): Long = {
+  def longToDayTimeInterval(v: Long, startField: Byte, endField: Byte): Long = {
     try {
       endField match {
         case DAY => Math.multiplyExact(v, MICROS_PER_DAY)
@@ -1329,7 +1140,10 @@ object IntervalUtils {
       }
     } catch {
       case _: ArithmeticException =>
-        throw QueryExecutionErrors.castingCauseOverflowError(v, DT(endField).catalogString)
+        throw QueryExecutionErrors.castingCauseOverflowError(
+          v,
+          LongType,
+          DayTimeIntervalType(startField, endField))
     }
   }
 
@@ -1342,12 +1156,40 @@ object IntervalUtils {
     }
   }
 
+  def dayTimeIntervalToDecimal(v: Long, endField: Byte): Decimal = {
+    endField match {
+      case DAY => Decimal(v / MICROS_PER_DAY)
+      case HOUR => Decimal(v / MICROS_PER_HOUR)
+      case MINUTE => Decimal(v / MICROS_PER_MINUTE)
+      case SECOND => Decimal(v, Decimal.MAX_LONG_DIGITS, 6)
+    }
+  }
+
+  def decimalToDayTimeInterval(
+      d: Decimal, p: Int, s: Int, startField: Byte, endField: Byte): Long = {
+    try {
+      val micros = endField match {
+        case DAY => d.toBigDecimal * MICROS_PER_DAY
+        case HOUR => d.toBigDecimal * MICROS_PER_HOUR
+        case MINUTE => d.toBigDecimal * MICROS_PER_MINUTE
+        case SECOND => d.toBigDecimal * MICROS_PER_SECOND
+      }
+      micros.setScale(0, BigDecimal.RoundingMode.HALF_UP).toLongExact
+    } catch {
+      case _: ArithmeticException =>
+        throw QueryExecutionErrors.castingCauseOverflowError(
+          d, DecimalType(p, s), DT(startField, endField))
+    }
+  }
+
   def dayTimeIntervalToInt(v: Long, startField: Byte, endField: Byte): Int = {
     val vLong = dayTimeIntervalToLong(v, startField, endField)
     val vInt = vLong.toInt
     if (vLong != vInt) {
       throw QueryExecutionErrors.castingCauseOverflowError(
-        toDayTimeIntervalString(v, ANSI_STYLE, startField, endField), IntegerType.catalogString)
+        v,
+        DayTimeIntervalType(startField, endField),
+        IntegerType)
     }
     vInt
   }
@@ -1357,7 +1199,9 @@ object IntervalUtils {
     val vShort = vLong.toShort
     if (vLong != vShort) {
       throw QueryExecutionErrors.castingCauseOverflowError(
-        toDayTimeIntervalString(v, ANSI_STYLE, startField, endField), ShortType.catalogString)
+        v,
+        DayTimeIntervalType(startField, endField),
+        ShortType)
     }
     vShort
   }
@@ -1367,7 +1211,9 @@ object IntervalUtils {
     val vByte = vLong.toByte
     if (vLong != vByte) {
       throw QueryExecutionErrors.castingCauseOverflowError(
-        toDayTimeIntervalString(v, ANSI_STYLE, startField, endField), ByteType.catalogString)
+        v,
+        DayTimeIntervalType(startField, endField),
+        ByteType)
     }
     vByte
   }

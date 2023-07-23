@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.util
 
 import java.sql.{Date, Timestamp}
 import java.time._
-import java.time.temporal.{ChronoField, ChronoUnit, IsoFields}
+import java.time.temporal.{ChronoField, ChronoUnit, IsoFields, Temporal}
 import java.util.{Locale, TimeZone}
 import java.util.concurrent.TimeUnit._
 
@@ -27,10 +27,11 @@ import scala.util.control.NonFatal
 
 import sun.util.calendar.ZoneInfo
 
+import org.apache.spark.sql.catalyst.trees.SQLQueryContext
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.RebaseDateTime._
 import org.apache.spark.sql.errors.QueryExecutionErrors
-import org.apache.spark.sql.types.{DateType, Decimal, DoubleExactNumeric, TimestampNTZType, TimestampType}
+import org.apache.spark.sql.types.{DateType, Decimal, DoubleExactNumeric, DoubleType, StringType, TimestampNTZType, TimestampType}
 import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 /**
@@ -108,6 +109,17 @@ object DateTimeUtils {
   }
 
   /**
+   * Converts an Java object to days.
+   *
+   * @param obj Either an object of `java.sql.Date` or `java.time.LocalDate`.
+   * @return The number of days since 1970-01-01.
+   */
+  def anyToDays(obj: Any): Int = obj match {
+    case d: Date => fromJavaDate(d)
+    case ld: LocalDate => localDateToDays(ld)
+  }
+
+  /**
    * Converts days since the epoch 1970-01-01 in Proleptic Gregorian calendar to a local date
    * at the default JVM time zone in the hybrid calendar (Julian + Gregorian). It rebases the given
    * days from Proleptic Gregorian to the hybrid calendar at UTC time zone for simplicity because
@@ -147,11 +159,19 @@ object DateTimeUtils {
    * @param micros The number of microseconds since 1970-01-01T00:00:00.000000Z.
    * @return A `java.sql.Timestamp` from number of micros since epoch.
    */
-  def toJavaTimestamp(micros: Long): Timestamp = {
-    val rebasedMicros = rebaseGregorianToJulianMicros(micros)
-    val seconds = Math.floorDiv(rebasedMicros, MICROS_PER_SECOND)
+  def toJavaTimestamp(micros: Long): Timestamp =
+    toJavaTimestampNoRebase(rebaseGregorianToJulianMicros(micros))
+
+  /**
+   * Converts microseconds since the epoch to an instance of `java.sql.Timestamp`.
+   *
+   * @param micros The number of microseconds since 1970-01-01T00:00:00.000000Z.
+   * @return A `java.sql.Timestamp` from number of micros since epoch.
+   */
+  def toJavaTimestampNoRebase(micros: Long): Timestamp = {
+    val seconds = Math.floorDiv(micros, MICROS_PER_SECOND)
     val ts = new Timestamp(seconds * MILLIS_PER_SECOND)
-    val nanos = (rebasedMicros - seconds * MICROS_PER_SECOND) * NANOS_PER_MICROS
+    val nanos = (micros - seconds * MICROS_PER_SECOND) * NANOS_PER_MICROS
     ts.setNanos(nanos.toInt)
     ts
   }
@@ -175,9 +195,29 @@ object DateTimeUtils {
    *          Gregorian calendars.
    * @return The number of micros since epoch from `java.sql.Timestamp`.
    */
-  def fromJavaTimestamp(t: Timestamp): Long = {
-    val micros = millisToMicros(t.getTime) + (t.getNanos / NANOS_PER_MICROS) % MICROS_PER_MILLIS
-    rebaseJulianToGregorianMicros(micros)
+  def fromJavaTimestamp(t: Timestamp): Long =
+    rebaseJulianToGregorianMicros(fromJavaTimestampNoRebase(t))
+
+  /**
+   * Converts an instance of `java.sql.Timestamp` to the number of microseconds since
+   * 1970-01-01T00:00:00.000000Z.
+   *
+   * @param t an instance of `java.sql.Timestamp`.
+   * @return The number of micros since epoch from `java.sql.Timestamp`.
+   */
+  def fromJavaTimestampNoRebase(t: Timestamp): Long =
+    millisToMicros(t.getTime) + (t.getNanos / NANOS_PER_MICROS) % MICROS_PER_MILLIS
+
+  /**
+   * Converts an Java object to microseconds.
+   *
+   * @param obj Either an object of `java.sql.Timestamp` or `java.time.{Instant,LocalDateTime}`.
+   * @return The number of micros since the epoch.
+   */
+  def anyToMicros(obj: Any): Long = obj match {
+    case t: Timestamp => fromJavaTimestamp(t)
+    case i: Instant => instantToMicros(i)
+    case ldt: LocalDateTime => localDateTimeToMicros(ldt)
   }
 
   /**
@@ -215,7 +255,7 @@ object DateTimeUtils {
    * Converts milliseconds since the epoch to microseconds.
    */
   def millisToMicros(millis: Long): Long = {
-    Math.multiplyExact(millis, MICROS_PER_MILLIS)
+    SparkDateTimeUtils.millisToMicros(millis)
   }
 
   private final val gmtUtf8 = UTF8String.fromString("GMT")
@@ -426,15 +466,20 @@ object DateTimeUtils {
     }
   }
 
-  def stringToTimestampAnsi(s: UTF8String, timeZoneId: ZoneId): Long = {
+  def stringToTimestampAnsi(
+      s: UTF8String,
+      timeZoneId: ZoneId,
+      context: SQLQueryContext = null): Long = {
     stringToTimestamp(s, timeZoneId).getOrElse {
-      throw QueryExecutionErrors.cannotCastToDateTimeError(s, TimestampType)
+      throw QueryExecutionErrors.invalidInputInCastToDatetimeError(
+        s, StringType, TimestampType, context)
     }
   }
 
-  def doubleToTimestampAnsi(d: Double): Long = {
+  def doubleToTimestampAnsi(d: Double, context: SQLQueryContext): Long = {
     if (d.isNaN || d.isInfinite) {
-      throw QueryExecutionErrors.cannotCastToDateTimeError(d, TimestampType)
+      throw QueryExecutionErrors.invalidInputInCastToDatetimeError(
+        d, DoubleType, TimestampType, context)
     } else {
       DoubleExactNumeric.toLong(d * MICROS_PER_SECOND)
     }
@@ -481,9 +526,12 @@ object DateTimeUtils {
     stringToTimestampWithoutTimeZone(s, true)
   }
 
-  def stringToTimestampWithoutTimeZoneAnsi(s: UTF8String): Long = {
+  def stringToTimestampWithoutTimeZoneAnsi(
+      s: UTF8String,
+      context: SQLQueryContext): Long = {
     stringToTimestampWithoutTimeZone(s, true).getOrElse {
-      throw QueryExecutionErrors.cannotCastToDateTimeError(s, TimestampNTZType)
+      throw QueryExecutionErrors.invalidInputInCastToDatetimeError(
+        s, StringType, TimestampNTZType, context)
     }
   }
 
@@ -522,7 +570,7 @@ object DateTimeUtils {
   /**
    * Converts the local date to the number of days since 1970-01-01.
    */
-  def localDateToDays(localDate: LocalDate): Int = Math.toIntExact(localDate.toEpochDay)
+  def localDateToDays(localDate: LocalDate): Int = MathUtils.toIntExact(localDate.toEpochDay)
 
   /**
    * Obtains an instance of `java.time.LocalDate` from the epoch day count.
@@ -544,7 +592,7 @@ object DateTimeUtils {
   def stringToDate(s: UTF8String): Option[Int] = {
     def isValidDigits(segment: Int, digits: Int): Boolean = {
       // An integer is able to represent a date within [+-]5 million years.
-      var maxDigitsYear = 7
+      val maxDigitsYear = 7
       (segment == 0 && digits >= 4 && digits <= maxDigitsYear) ||
         (segment != 0 && digits > 0 && digits <= 2)
     }
@@ -599,9 +647,12 @@ object DateTimeUtils {
     }
   }
 
-  def stringToDateAnsi(s: UTF8String): Int = {
+  def stringToDateAnsi(
+      s: UTF8String,
+      context: SQLQueryContext = null): Int = {
     stringToDate(s).getOrElse {
-      throw QueryExecutionErrors.cannotCastToDateTimeError(s, DateType)
+      throw QueryExecutionErrors.invalidInputInCastToDatetimeError(
+        s, StringType, DateType, context)
     }
   }
 
@@ -997,6 +1048,23 @@ object DateTimeUtils {
   }
 
   /**
+   * Converts a timestamp without time zone from a source to target time zone.
+   *
+   * @param sourceTz The time zone for the input timestamp without time zone.
+   * @param targetTz The time zone to which the input timestamp should be converted.
+   * @param micros The offset in microseconds represents a local timestamp.
+   * @return The timestamp without time zone represents the same moment (physical time) as
+   *         the input timestamp in the input time zone, but in the destination time zone.
+   */
+  def convertTimestampNtzToAnotherTz(sourceTz: String, targetTz: String, micros: Long): Long = {
+    val ldt = microsToLocalDateTime(micros)
+      .atZone(getZoneId(sourceTz))
+      .withZoneSameInstant(getZoneId(targetTz))
+      .toLocalDateTime
+    localDateTimeToMicros(ldt)
+  }
+
+  /**
    * Returns a timestamp of given timezone from UTC timestamp, with the same string
    * representation in their timezone.
    */
@@ -1145,5 +1213,86 @@ object DateTimeUtils {
     val localEndTs = getLocalDateTime(endMicros, zoneId)
     val localStartTs = getLocalDateTime(startMicros, zoneId)
     ChronoUnit.MICROS.between(localStartTs, localEndTs)
+  }
+
+  /**
+   * Adds the specified number of units to a timestamp.
+   *
+   * @param unit A keyword that specifies the interval units to add to the input timestamp.
+   * @param quantity The amount of `unit`s to add. It can be positive or negative.
+   * @param micros The input timestamp value, expressed in microseconds since 1970-01-01 00:00:00Z.
+   * @param zoneId The time zone ID at which the operation is performed.
+   * @return A timestamp value, expressed in microseconds since 1970-01-01 00:00:00Z.
+   */
+  def timestampAdd(unit: String, quantity: Int, micros: Long, zoneId: ZoneId): Long = {
+    try {
+      unit.toUpperCase(Locale.ROOT) match {
+        case "MICROSECOND" =>
+          timestampAddInterval(micros, 0, 0, quantity, zoneId)
+        case "MILLISECOND" =>
+          timestampAddInterval(micros, 0, 0,
+            Math.multiplyExact(quantity.toLong, MICROS_PER_MILLIS), zoneId)
+        case "SECOND" =>
+          timestampAddInterval(micros, 0, 0,
+            Math.multiplyExact(quantity.toLong, MICROS_PER_SECOND), zoneId)
+        case "MINUTE" =>
+          timestampAddInterval(micros, 0, 0,
+            Math.multiplyExact(quantity.toLong, MICROS_PER_MINUTE), zoneId)
+        case "HOUR" =>
+          timestampAddInterval(micros, 0, 0,
+            Math.multiplyExact(quantity.toLong, MICROS_PER_HOUR), zoneId)
+        case "DAY" | "DAYOFYEAR" =>
+          timestampAddInterval(micros, 0, quantity, 0, zoneId)
+        case "WEEK" =>
+          timestampAddInterval(micros, 0, Math.multiplyExact(quantity, DAYS_PER_WEEK), 0, zoneId)
+        case "MONTH" =>
+          timestampAddMonths(micros, quantity, zoneId)
+        case "QUARTER" =>
+          timestampAddMonths(micros, Math.multiplyExact(quantity, 3), zoneId)
+        case "YEAR" =>
+          timestampAddMonths(micros, Math.multiplyExact(quantity, MONTHS_PER_YEAR), zoneId)
+      }
+    } catch {
+      case _: scala.MatchError =>
+        throw new IllegalStateException(s"Got the unexpected unit '$unit'.")
+      case _: ArithmeticException | _: DateTimeException =>
+        throw QueryExecutionErrors.timestampAddOverflowError(micros, quantity, unit)
+      case e: Throwable =>
+        throw new IllegalStateException(s"Failure of 'timestampAdd': ${e.getMessage}")
+    }
+  }
+
+  private val timestampDiffMap = Map[String, (Temporal, Temporal) => Long](
+    "MICROSECOND" -> ChronoUnit.MICROS.between,
+    "MILLISECOND" -> ChronoUnit.MILLIS.between,
+    "SECOND" -> ChronoUnit.SECONDS.between,
+    "MINUTE" -> ChronoUnit.MINUTES.between,
+    "HOUR" -> ChronoUnit.HOURS.between,
+    "DAY" -> ChronoUnit.DAYS.between,
+    "WEEK" -> ChronoUnit.WEEKS.between,
+    "MONTH" -> ChronoUnit.MONTHS.between,
+    "QUARTER" -> ((startTs: Temporal, endTs: Temporal) =>
+      ChronoUnit.MONTHS.between(startTs, endTs) / 3),
+    "YEAR" -> ChronoUnit.YEARS.between)
+
+  /**
+   * Gets the difference between two timestamps.
+   *
+   * @param unit Specifies the interval units in which to express the difference between
+   *             the two timestamp parameters.
+   * @param startTs A timestamp which the function subtracts from `endTs`.
+   * @param endTs A timestamp from which the function subtracts `startTs`.
+   * @param zoneId The time zone ID at which the operation is performed.
+   * @return The time span between two timestamp values, in the units specified.
+   */
+  def timestampDiff(unit: String, startTs: Long, endTs: Long, zoneId: ZoneId): Long = {
+    val unitInUpperCase = unit.toUpperCase(Locale.ROOT)
+    if (timestampDiffMap.contains(unitInUpperCase)) {
+      val startLocalTs = getLocalDateTime(startTs, zoneId)
+      val endLocalTs = getLocalDateTime(endTs, zoneId)
+      timestampDiffMap(unitInUpperCase)(startLocalTs, endLocalTs)
+    } else {
+      throw new IllegalStateException(s"Got the unexpected unit '$unit'.")
+    }
   }
 }

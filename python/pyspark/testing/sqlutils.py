@@ -24,7 +24,7 @@ from contextlib import contextmanager
 
 from pyspark.sql import SparkSession
 from pyspark.sql.types import ArrayType, DoubleType, UserDefinedType, Row
-from pyspark.testing.utils import ReusedPySparkTestCase
+from pyspark.testing.utils import ReusedPySparkTestCase, PySparkErrorTestUtils
 
 
 pandas_requirement_message = None
@@ -79,7 +79,7 @@ class ExamplePointUDT(UserDefinedType):
     """
 
     @classmethod
-    def sqlType(self):
+    def sqlType(cls):
         return ArrayType(DoubleType(), False)
 
     @classmethod
@@ -124,7 +124,7 @@ class PythonOnlyUDT(UserDefinedType):
     """
 
     @classmethod
-    def sqlType(self):
+    def sqlType(cls):
         return ArrayType(DoubleType(), False)
 
     @classmethod
@@ -154,13 +154,13 @@ class PythonOnlyPoint(ExamplePoint):
     __UDT__ = PythonOnlyUDT()  # type: ignore
 
 
-class MyObject(object):
+class MyObject:
     def __init__(self, key, value):
         self.key = key
         self.value = value
 
 
-class SQLTestUtils(object):
+class SQLTestUtils:
     """
     This util assumes the instance of this to have 'spark' attribute, having a spark session.
     It is usually used with 'ReusedSQLTestCase' class but can be used if you feel sure the
@@ -251,10 +251,10 @@ class SQLTestUtils(object):
     def assert_close(a, b):
         c = [j[0] for j in b]
         diff = [abs(v - c[k]) < 1e-6 if math.isfinite(v) else v == c[k] for k, v in enumerate(a)]
-        return sum(diff) == len(a)
+        assert sum(diff) == len(a), f"sum: {sum(diff)}, len: {len(a)}"
 
 
-class ReusedSQLTestCase(ReusedPySparkTestCase, SQLTestUtils):
+class ReusedSQLTestCase(ReusedPySparkTestCase, SQLTestUtils, PySparkErrorTestUtils):
     @classmethod
     def setUpClass(cls):
         super(ReusedSQLTestCase, cls).setUpClass()

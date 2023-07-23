@@ -50,7 +50,7 @@ import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, DateFormatter, Type
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.datasources.PartitioningUtils
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{AtomicType, DateType, IntegralType, StringType}
+import org.apache.spark.sql.types.{AtomicType, DateType, IntegralType, IntegralTypeExpression, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
@@ -620,7 +620,12 @@ private[client] class Shim_v0_12 extends Shim with Logging {
       tableName: String,
       throwException: Boolean): Table = {
     recordHiveCall()
-    hive.getTable(dbName, tableName, throwException)
+    val table = hive.getTable(dbName, tableName, throwException)
+    if (table != null) {
+      table.getTTable.setTableName(tableName)
+      table.getTTable.setDbName(dbName)
+    }
+    table
   }
 
   override def getTablesByPattern(hive: Hive, dbName: String, pattern: String): Seq[String] = {
@@ -832,6 +837,7 @@ private[client] class Shim_v0_13 extends Shim_v0_12 {
     }
   }
 
+  @scala.annotation.tailrec
   private def isCausedBy(e: Throwable, matchMassage: String): Boolean = {
     if (e.getMessage.contains(matchMassage)) {
       true
@@ -874,7 +880,7 @@ private[client] class Shim_v0_13 extends Shim_v0_12 {
         case Literal(value, _: IntegralType) => Some(value.toString)
         case Literal(value, _: StringType) => Some(quoteStringLiteral(value.toString))
         case Literal(value, _: DateType) =>
-          Some(dateFormatter.format(value.asInstanceOf[Int]))
+          Some(quoteStringLiteral(dateFormatter.format(value.asInstanceOf[Int])))
         case _ => None
       }
     }
@@ -927,7 +933,7 @@ private[client] class Shim_v0_13 extends Shim_v0_12 {
 
     object ExtractableDateValues {
       private lazy val valueToLiteralString: PartialFunction[Any, String] = {
-        case value: Int => dateFormatter.format(value)
+        case value: Int => quoteStringLiteral(dateFormatter.format(value))
       }
 
       def unapply(values: Set[Any]): Option[Seq[String]] = {
@@ -977,10 +983,11 @@ private[client] class Shim_v0_13 extends Shim_v0_12 {
     val inSetThreshold = SQLConf.get.metastorePartitionPruningInSetThreshold
 
     object ExtractAttribute {
+      @scala.annotation.tailrec
       def unapply(expr: Expression): Option[Attribute] = {
         expr match {
           case attr: Attribute => Some(attr)
-          case Cast(child @ IntegralType(), dt: IntegralType, _, _)
+          case Cast(child @ IntegralTypeExpression(), dt: IntegralType, _, _)
               if Cast.canUpCast(child.dataType.asInstanceOf[AtomicType], dt) => unapply(child)
           case _ => None
         }
@@ -1143,9 +1150,11 @@ private[client] class Shim_v0_13 extends Shim_v0_12 {
     // Because there is no way to know whether the partition properties has timeZone,
     // client-side filtering cannot be used with TimeZoneAwareExpression.
     def hasTimeZoneAwareExpression(e: Expression): Boolean = {
-      e.collectFirst {
-        case t: TimeZoneAwareExpression => t
-      }.isDefined
+      e.exists {
+        case cast: Cast => cast.needsTimeZone
+        case tz: TimeZoneAwareExpression => !tz.isInstanceOf[Cast]
+        case _ => false
+      }
     }
 
     if (!SQLConf.get.metastorePartitionPruningFastFallback ||
@@ -1171,6 +1180,7 @@ private[client] class Shim_v0_13 extends Shim_v0_12 {
           })
         }
 
+        recordHiveCall()
         val allPartitionNames = hive.getPartitionNames(
           table.getDbName, table.getTableName, -1).asScala
         val partNames = allPartitionNames.filter { p =>

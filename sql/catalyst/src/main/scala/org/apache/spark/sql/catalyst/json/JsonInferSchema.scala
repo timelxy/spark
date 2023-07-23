@@ -46,12 +46,18 @@ private[sql] class JsonInferSchema(options: JSONOptions) extends Serializable {
     options.locale,
     legacyFormat = FAST_DATE_FORMAT,
     isParsing = true)
+  private val timestampNTZFormatter = TimestampFormatter(
+    options.timestampNTZFormatInRead,
+    options.zoneId,
+    legacyFormat = FAST_DATE_FORMAT,
+    isParsing = true,
+    forTimestampNTZ = true)
 
   private def handleJsonErrorsByParseMode(parseMode: ParseMode,
       columnNameOfCorruptRecord: String, e: Throwable): Option[StructType] = {
     parseMode match {
       case PermissiveMode =>
-        Some(StructType(Seq(StructField(columnNameOfCorruptRecord, StringType))))
+        Some(StructType(Array(StructField(columnNameOfCorruptRecord, StringType))))
       case DropMalformedMode =>
         None
       case FailFastMode =>
@@ -94,7 +100,7 @@ private[sql] class JsonInferSchema(options: JSONOptions) extends Serializable {
             wrappedCharException.initCause(e)
             handleJsonErrorsByParseMode(parseMode, columnNameOfCorruptRecord, wrappedCharException)
         }
-      }.reduceOption(typeMerger).toIterator
+      }.reduceOption(typeMerger).iterator
     }
 
     // Here we manually submit a fold-like Spark job, so that we can set the SQLConf when running
@@ -145,7 +151,10 @@ private[sql] class JsonInferSchema(options: JSONOptions) extends Serializable {
         if (options.prefersDecimal && decimalTry.isDefined) {
           decimalTry.get
         } else if (options.inferTimestamp &&
-            (allCatch opt timestampFormatter.parse(field)).isDefined) {
+            timestampNTZFormatter.parseWithoutTimeZoneOptional(field, false).isDefined) {
+          SQLConf.get.timestampType
+        } else if (options.inferTimestamp &&
+            timestampFormatter.parseOptional(field).isDefined) {
           TimestampType
         } else {
           StringType
@@ -392,6 +401,9 @@ object JsonInferSchema {
           compatibleType(DecimalType.forType(t1), t2)
         case (t1: DecimalType, t2: IntegralType) =>
           compatibleType(t1, DecimalType.forType(t2))
+
+        case (TimestampNTZType, TimestampType) | (TimestampType, TimestampNTZType) =>
+          TimestampType
 
         // strings and every string is a Json object.
         case (_, _) => StringType

@@ -21,9 +21,11 @@ import java.sql.Timestamp
 import java.text.{ParseException, ParsePosition, SimpleDateFormat}
 import java.time._
 import java.time.format.{DateTimeFormatter, DateTimeParseException}
+import java.time.temporal.{TemporalAccessor, TemporalQueries}
 import java.time.temporal.ChronoField.MICRO_OF_SECOND
-import java.time.temporal.TemporalQueries
 import java.util.{Calendar, GregorianCalendar, Locale, TimeZone}
+
+import scala.util.control.NonFatal
 
 import org.apache.commons.lang3.time.FastDateFormat
 
@@ -53,6 +55,25 @@ sealed trait TimestampFormatter extends Serializable {
   def parse(s: String): Long
 
   /**
+   * Parses a timestamp in a string and converts it to an optional number of microseconds.
+   *
+   * @param s - string with timestamp to parse
+   * @return An optional number of microseconds since epoch. The result is None on invalid input.
+   * @throws ParseException can be thrown by legacy parser
+   * @throws DateTimeParseException can be thrown by new parser
+   * @throws DateTimeException unable to obtain local date or time
+   */
+  @throws(classOf[ParseException])
+  @throws(classOf[DateTimeParseException])
+  @throws(classOf[DateTimeException])
+  def parseOptional(s: String): Option[Long] =
+    try {
+      Some(parse(s))
+    } catch {
+      case _: Exception => None
+    }
+
+  /**
    * Parses a timestamp in a string and converts it to microseconds since Unix Epoch in local time.
    *
    * @param s - string with timestamp to parse
@@ -72,6 +93,30 @@ sealed trait TimestampFormatter extends Serializable {
     throw new IllegalStateException(
       s"The method `parseWithoutTimeZone(s: String, allowTimeZone: Boolean)` should be " +
         "implemented in the formatter of timestamp without time zone")
+
+  /**
+   * Parses a timestamp in a string and converts it to an optional number of microseconds since
+   * Unix Epoch in local time.
+   *
+   * @param s - string with timestamp to parse
+   * @param allowTimeZone - indicates strict parsing of timezone
+   * @return An optional number of microseconds since epoch. The result is None on invalid input.
+   * @throws ParseException can be thrown by legacy parser
+   * @throws DateTimeParseException can be thrown by new parser
+   * @throws DateTimeException unable to obtain local date or time
+   * @throws IllegalStateException The formatter for timestamp without time zone should always
+   *                               implement this method. The exception should never be hit.
+   */
+  @throws(classOf[ParseException])
+  @throws(classOf[DateTimeParseException])
+  @throws(classOf[DateTimeException])
+  @throws(classOf[IllegalStateException])
+  def parseWithoutTimeZoneOptional(s: String, allowTimeZone: Boolean): Option[Long] =
+    try {
+      Some(parseWithoutTimeZone(s, allowTimeZone))
+    } catch {
+      case _: Exception => None
+    }
 
   /**
    * Parses a timestamp in a string and converts it to microseconds since Unix Epoch in local time.
@@ -120,28 +165,64 @@ class Iso8601TimestampFormatter(
   protected lazy val legacyFormatter = TimestampFormatter.getLegacyFormatter(
     pattern, zoneId, locale, legacyFormat)
 
+  override def parseOptional(s: String): Option[Long] = {
+    try {
+      val parsed = formatter.parseUnresolved(s, new ParsePosition(0))
+      if (parsed != null) {
+        Some(extractMicros(parsed))
+      } else {
+        None
+      }
+    } catch {
+      case NonFatal(_) => None
+    }
+  }
+
+  private def extractMicros(parsed: TemporalAccessor): Long = {
+    val parsedZoneId = parsed.query(TemporalQueries.zone())
+    val timeZoneId = if (parsedZoneId == null) zoneId else parsedZoneId
+    val zonedDateTime = toZonedDateTime(parsed, timeZoneId)
+    val epochSeconds = zonedDateTime.toEpochSecond
+    val microsOfSecond = zonedDateTime.get(MICRO_OF_SECOND)
+    Math.addExact(Math.multiplyExact(epochSeconds, MICROS_PER_SECOND), microsOfSecond)
+  }
+
   override def parse(s: String): Long = {
     try {
       val parsed = formatter.parse(s)
-      val parsedZoneId = parsed.query(TemporalQueries.zone())
-      val timeZoneId = if (parsedZoneId == null) zoneId else parsedZoneId
-      val zonedDateTime = toZonedDateTime(parsed, timeZoneId)
-      val epochSeconds = zonedDateTime.toEpochSecond
-      val microsOfSecond = zonedDateTime.get(MICRO_OF_SECOND)
-
-      Math.addExact(Math.multiplyExact(epochSeconds, MICROS_PER_SECOND), microsOfSecond)
+      extractMicros(parsed)
     } catch checkParsedDiff(s, legacyFormatter.parse)
+  }
+
+  override def parseWithoutTimeZoneOptional(s: String, allowTimeZone: Boolean): Option[Long] = {
+    try {
+      val parsed = formatter.parseUnresolved(s, new ParsePosition(0))
+      if (parsed != null) {
+        Some(extractMicrosNTZ(s, parsed, allowTimeZone))
+      } else {
+        None
+      }
+    } catch {
+      case NonFatal(_) => None
+    }
+  }
+
+  private def extractMicrosNTZ(
+      s: String,
+      parsed: TemporalAccessor,
+      allowTimeZone: Boolean): Long = {
+    if (!allowTimeZone && parsed.query(TemporalQueries.zone()) != null) {
+      throw QueryExecutionErrors.cannotParseStringAsDataTypeError(pattern, s, TimestampNTZType)
+    }
+    val localDate = toLocalDate(parsed)
+    val localTime = toLocalTime(parsed)
+    DateTimeUtils.localDateTimeToMicros(LocalDateTime.of(localDate, localTime))
   }
 
   override def parseWithoutTimeZone(s: String, allowTimeZone: Boolean): Long = {
     try {
       val parsed = formatter.parse(s)
-      if (!allowTimeZone && parsed.query(TemporalQueries.zone()) != null) {
-        throw QueryExecutionErrors.cannotParseStringAsDataTypeError(pattern, s, TimestampNTZType)
-      }
-      val localDate = toLocalDate(parsed)
-      val localTime = toLocalTime(parsed)
-      DateTimeUtils.localDateTimeToMicros(LocalDateTime.of(localDate, localTime))
+      extractMicrosNTZ(s, parsed, allowTimeZone)
     } catch checkParsedDiff(s, legacyFormatter.parse)
   }
 
@@ -204,6 +285,9 @@ class DefaultTimestampFormatter(
     } catch checkParsedDiff(s, legacyFormatter.parse)
   }
 
+  override def parseOptional(s: String): Option[Long] =
+    DateTimeUtils.stringToTimestamp(UTF8String.fromString(s), zoneId)
+
   override def parseWithoutTimeZone(s: String, allowTimeZone: Boolean): Long = {
     try {
       val utf8Value = UTF8String.fromString(s)
@@ -212,6 +296,11 @@ class DefaultTimestampFormatter(
           TimestampFormatter.defaultPattern(), s, TimestampNTZType)
       }
     } catch checkParsedDiff(s, legacyFormatter.parse)
+  }
+
+  override def parseWithoutTimeZoneOptional(s: String, allowTimeZone: Boolean): Option[Long] = {
+    val utf8Value = UTF8String.fromString(s)
+    DateTimeUtils.stringToTimestampWithoutTimeZone(utf8Value, allowTimeZone)
   }
 }
 
@@ -318,6 +407,19 @@ class LegacyFastTimestampFormatter(
     if (!fastDateFormat.parse(s, new ParsePosition(0), cal)) {
       throw new IllegalArgumentException(s"'$s' is an invalid timestamp")
     }
+    extractMicros(cal)
+  }
+
+  override def parseOptional(s: String): Option[Long] = {
+    cal.clear() // Clear the calendar because it can be re-used many times
+    if (fastDateFormat.parse(s, new ParsePosition(0), cal)) {
+      Some(extractMicros(cal))
+    } else {
+      None
+    }
+  }
+
+  private def extractMicros(cal: MicrosCalendar): Long = {
     val micros = cal.getMicros()
     cal.set(Calendar.MILLISECOND, 0)
     val julianMicros = Math.addExact(millisToMicros(cal.getTimeInMillis), micros)
@@ -360,6 +462,15 @@ class LegacySimpleTimestampFormatter(
 
   override def parse(s: String): Long = {
     fromJavaTimestamp(new Timestamp(sdf.parse(s).getTime))
+  }
+
+  override def parseOptional(s: String): Option[Long] = {
+    val date = sdf.parse(s, new ParsePosition(0))
+    if (date == null) {
+      None
+    } else {
+      Some(fromJavaTimestamp(new Timestamp(date.getTime)))
+    }
   }
 
   override def format(us: Long): String = {
@@ -472,6 +583,14 @@ object TimestampFormatter {
       zoneId: ZoneId,
       isParsing: Boolean): TimestampFormatter = {
     getFormatter(Some(format), zoneId, isParsing = isParsing)
+  }
+
+  def apply(
+      format: String,
+      zoneId: ZoneId,
+      isParsing: Boolean,
+      forTimestampNTZ: Boolean): TimestampFormatter = {
+    getFormatter(Some(format), zoneId, isParsing = isParsing, forTimestampNTZ = forTimestampNTZ)
   }
 
   def apply(zoneId: ZoneId): TimestampFormatter = {

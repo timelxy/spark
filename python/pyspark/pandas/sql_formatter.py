@@ -17,7 +17,7 @@
 
 import os
 import string
-from typing import Any, Optional, Union, List, Sequence, Mapping, Tuple
+from typing import Any, Dict, Optional, Union, List, Sequence, Mapping, Tuple
 import uuid
 import warnings
 
@@ -25,7 +25,6 @@ import pandas as pd
 
 from pyspark.pandas.internal import InternalFrame
 from pyspark.pandas.namespace import _get_index_map
-from pyspark.sql.functions import lit
 from pyspark import pandas as ps
 from pyspark.sql import SparkSession
 from pyspark.pandas.utils import default_session
@@ -43,6 +42,7 @@ _CAPTURE_SCOPES = 3
 def sql(
     query: str,
     index_col: Optional[Union[str, List[str]]] = None,
+    args: Optional[Union[Dict[str, Any], List]] = None,
     **kwargs: Any,
 ) -> DataFrame:
     """
@@ -57,6 +57,8 @@ def sql(
         * pandas Series
         * string
 
+    Also the method can bind named parameters to SQL literals from `args`.
+
     Parameters
     ----------
     query : str
@@ -66,7 +68,7 @@ def sql(
         in pandas-on-Spark is ignored. By default, the index is always lost.
 
         .. note:: If you want to preserve the index, explicitly use :func:`DataFrame.reset_index`,
-            and pass it to the sql statement with `index_col` parameter.
+            and pass it to the SQL statement with `index_col` parameter.
 
             For example,
 
@@ -89,7 +91,8 @@ def sql(
             ...     ),
             ... )
             >>> new_psdf = psdf.reset_index()
-            >>> ps.sql("SELECT * FROM {new_psdf}", index_col=["index1", "index2"], new_psdf=new_psdf)
+            >>> ps.sql(
+            ...     "SELECT * FROM {new_psdf}", index_col=["index1", "index2"], new_psdf=new_psdf)
             ... # doctest: +NORMALIZE_WHITESPACE
                            A  B
             index1 index2
@@ -98,6 +101,21 @@ def sql(
             e      f       3  6
 
             Also note that the index name(s) should be matched to the existing name.
+    args : dict or list
+        A dictionary of parameter names to Python objects or a list of Python objects
+        that can be converted to SQL literal expressions. See
+        <a href="https://spark.apache.org/docs/latest/sql-ref-datatypes.html">
+        Supported Data Types</a> for supported value types in Python.
+        For example, dictionary keys: "rank", "name", "birthdate";
+        dictionary values: 1, "Steven", datetime.date(2023, 4, 2).
+        A value can be also a `Column` of literal expression, in that case it is taken as is.
+
+
+        .. versionadded:: 3.4.0
+
+        .. versionchanged:: 3.5.0
+            Added positional parameters.
+
     kwargs
         other variables that the user want to set that can be referenced in the query
 
@@ -151,6 +169,20 @@ def sql(
     0  1
     1  2
     2  3
+
+    And substitude named parameters with the `:` prefix by SQL literals.
+
+    >>> ps.sql("SELECT * FROM range(10) WHERE id > :bound1", args={"bound1":7})
+       id
+    0   8
+    1   9
+
+    Or positional parameters marked by `?` in the SQL query by SQL literals.
+
+    >>> ps.sql("SELECT * FROM range(10) WHERE id > ?", args=[7])
+       id
+    0   8
+    1   9
     """
     if os.environ.get("PYSPARK_PANDAS_SQL_LEGACY") == "1":
         from pyspark.pandas import sql_processor
@@ -163,9 +195,9 @@ def sql(
         return sql_processor.sql(query, index_col=index_col, **kwargs)
 
     session = default_session()
-    formatter = SQLStringFormatter(session)
+    formatter = PandasSQLStringFormatter(session)
     try:
-        sdf = session.sql(formatter.format(query, **kwargs))
+        sdf = session.sql(formatter.format(query, **kwargs), args)
     finally:
         formatter.clear()
 
@@ -178,10 +210,10 @@ def sql(
     )
 
 
-class SQLStringFormatter(string.Formatter):
+class PandasSQLStringFormatter(string.Formatter):
     """
     A standard ``string.Formatter`` in Python that can understand pandas-on-Spark instances
-    with basic Python objects. This object has to be clear after the use for single SQL
+    with basic Python objects. This object must be clear after the use for single SQL
     query; cannot be reused across multiple SQL queries without cleaning.
     """
 
@@ -191,7 +223,7 @@ class SQLStringFormatter(string.Formatter):
         self._ref_sers: List[Tuple[Series, str]] = []
 
     def vformat(self, format_string: str, args: Sequence[Any], kwargs: Mapping[str, Any]) -> str:
-        ret = super(SQLStringFormatter, self).vformat(format_string, args, kwargs)
+        ret = super(PandasSQLStringFormatter, self).vformat(format_string, args, kwargs)
 
         for ref, n in self._ref_sers:
             if not any((ref is v for v in df._pssers.values()) for df, _ in self._temp_views):
@@ -200,7 +232,7 @@ class SQLStringFormatter(string.Formatter):
         return ret
 
     def get_field(self, field_name: str, args: Sequence[Any], kwargs: Mapping[str, Any]) -> Any:
-        obj, first = super(SQLStringFormatter, self).get_field(field_name, args, kwargs)
+        obj, first = super(PandasSQLStringFormatter, self).get_field(field_name, args, kwargs)
         return self._convert_value(obj, field_name), first
 
     def _convert_value(self, val: Any, name: str) -> Optional[str]:
@@ -232,7 +264,10 @@ class SQLStringFormatter(string.Formatter):
             val._to_spark().createOrReplaceTempView(df_name)
             return df_name
         elif isinstance(val, str):
-            return lit(val)._jc.expr().sql()  # for escaped characters.
+            # This is matched to behavior from JVM implementation.
+            # See `sql` definition from `sql/catalyst/src/main/scala/org/apache/spark/
+            # sql/catalyst/expressions/literals.scala`
+            return "'" + val.replace("\\", "\\\\").replace("'", "\\'") + "'"
         else:
             return val
 
@@ -256,7 +291,7 @@ def _test() -> None:
     globs["ps"] = pyspark.pandas
     spark = (
         SparkSession.builder.master("local[4]")
-        .appName("pyspark.pandas.sql_processor tests")
+        .appName("pyspark.pandas.sql_formatter tests")
         .getOrCreate()
     )
     (failure_count, test_count) = doctest.testmod(

@@ -16,19 +16,15 @@
 #
 
 from pyspark import pandas as ps
-from pyspark.sql.utils import ParseException
+from pyspark.errors import ParseException
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 from pyspark.testing.sqlutils import SQLTestUtils
 
 
-class SQLTest(PandasOnSparkTestCase, SQLTestUtils):
+class SQLTestsMixin:
     def test_error_variable_not_exist(self):
         with self.assertRaisesRegex(KeyError, "variable_foo"):
             ps.sql("select * from {variable_foo}")
-
-    def test_error_unsupported_type(self):
-        with self.assertRaisesRegex(KeyError, "some_dict"):
-            ps.sql("select * from {some_dict}")
 
     def test_error_bad_sql(self):
         with self.assertRaises(ParseException):
@@ -85,6 +81,14 @@ class SQLTest(PandasOnSparkTestCase, SQLTestUtils):
             ps.sql("SELECT id FROM range(10) WHERE id IN {pred}", col="lit", pred=(1, 2, 3)),
             ps.DataFrame({"id": [1, 2, 3]}),
         )
+        self.assert_eq(
+            ps.sql("SELECT {col} as a FROM range(1)", col="a'''c''d"),
+            ps.DataFrame({"a": ["a'''c''d"]}),
+        )
+        self.assert_eq(
+            ps.sql("SELECT id FROM range(10) WHERE id IN {pred}", col="a'''c''d", pred=(1, 2, 3)),
+            ps.DataFrame({"id": [1, 2, 3]}),
+        )
 
     def test_sql_with_pandas_on_spark_objects(self):
         psdf = ps.DataFrame({"a": [1, 2, 3, 4]})
@@ -99,12 +103,16 @@ class SQLTest(PandasOnSparkTestCase, SQLTestUtils):
         self.assert_eq(ps.sql("SELECT {tbl.A}, {tbl.B} FROM {tbl}", tbl=psdf), psdf)
 
 
+class SQLTests(SQLTestsMixin, PandasOnSparkTestCase, SQLTestUtils):
+    pass
+
+
 if __name__ == "__main__":
     import unittest
     from pyspark.pandas.tests.test_sql import *  # noqa: F401
 
     try:
-        import xmlrunner  # type: ignore[import]
+        import xmlrunner
 
         testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
     except ImportError:

@@ -16,17 +16,21 @@
 #
 
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-from py4j.java_gateway import JavaObject  # type: ignore[import]
+from py4j.java_gateway import JavaObject
 
-from pyspark import since, _NoValue  # type: ignore[attr-defined]
+from pyspark import since, _NoValue
+from pyspark._globals import _NoValueType
 
 
-class RuntimeConfig(object):
+class RuntimeConfig:
     """User-facing configuration API, accessible through `SparkSession.conf`.
 
     Options set here are automatically propagated to the Hadoop configuration during I/O.
+
+    .. versionchanged:: 3.4.0
+        Supports Spark Connect.
     """
 
     def __init__(self, jconf: JavaObject) -> None:
@@ -34,14 +38,23 @@ class RuntimeConfig(object):
         self._jconf = jconf
 
     @since(2.0)
-    def set(self, key: str, value: str) -> None:
-        """Sets the given Spark runtime configuration property."""
+    def set(self, key: str, value: Union[str, int, bool]) -> None:
+        """Sets the given Spark runtime configuration property.
+
+        .. versionchanged:: 3.4.0
+            Supports Spark Connect.
+        """
         self._jconf.set(key, value)
 
     @since(2.0)
-    def get(self, key: str, default: Optional[str] = _NoValue) -> str:
+    def get(
+        self, key: str, default: Union[Optional[str], _NoValueType] = _NoValue
+    ) -> Optional[str]:
         """Returns the value of Spark runtime configuration property for the given key,
         assuming it is set.
+
+        .. versionchanged:: 3.4.0
+            Supports Spark Connect.
         """
         self._checkType(key, "key")
         if default is _NoValue:
@@ -53,7 +66,11 @@ class RuntimeConfig(object):
 
     @since(2.0)
     def unset(self, key: str) -> None:
-        """Resets the configuration property for the given key."""
+        """Resets the configuration property for the given key.
+
+        .. versionchanged:: 3.4.0
+            Supports Spark Connect.
+        """
         self._jconf.unset(key)
 
     def _checkType(self, obj: Any, identifier: str) -> None:
@@ -67,6 +84,9 @@ class RuntimeConfig(object):
     def isModifiable(self, key: str) -> bool:
         """Indicates whether the configuration property with the given key
         is modifiable in the current session.
+
+        .. versionchanged:: 3.4.0
+            Supports Spark Connect.
         """
         return self._jconf.isModifiable(key)
 
