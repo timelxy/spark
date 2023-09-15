@@ -1027,14 +1027,6 @@ class AnalysisErrorSuite extends AnalysisTest {
       LocalRelation(a))
     assertAnalysisError(plan3, "Accessing outer query column is not allowed in" :: Nil)
 
-    val plan4 = Filter(
-      Exists(
-        Limit(1,
-          Filter(EqualTo(UnresolvedAttribute("a"), b), LocalRelation(b)))
-      ),
-      LocalRelation(a))
-    assertAnalysisError(plan4, "Accessing outer query column is not allowed in" :: Nil)
-
     val plan5 = Filter(
       Exists(
         Sample(0.0, 0.5, false, 1L,
@@ -1137,13 +1129,13 @@ class AnalysisErrorSuite extends AnalysisTest {
       expectedMessageParameters = Map("sqlExpr" -> "\"scalarsubquery(c1)\""))
   }
 
-  errorTest(
+  errorClassTest(
     "SPARK-34920: error code to error message",
     testRelation2.where($"bad_column" > 1).groupBy($"a")(UnresolvedAlias(max($"b"))),
-    "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name " +
-      "`bad_column` cannot be resolved. Did you mean one of the following? " +
-      "[`a`, `c`, `d`, `b`, `e`]"
-      :: Nil)
+    errorClass = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+    messageParameters = Map(
+      "objectName" -> "`bad_column`",
+      "proposal" -> "`a`, `c`, `d`, `b`, `e`"))
 
   errorClassTest(
     "SPARK-39783: backticks in error message for candidate column with dots",

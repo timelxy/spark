@@ -40,6 +40,7 @@ import org.apache.spark.rpc._
 import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend.ENDPOINT_NAME
+import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{RpcUtils, SerializableBuffer, ThreadUtils, Utils}
 
 /**
@@ -122,6 +123,9 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
 
   // The num of current max ExecutorId used to re-register appMaster
   @volatile protected var currentExecutorIdCounter = 0
+
+  // Current log level of driver to send to executor
+  @volatile private var currentLogLevel: Option[String] = None
 
   // Current set of delegation tokens to send to executors.
   private val delegationTokens = new AtomicReference[Array[Byte]]()
@@ -318,6 +322,14 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
         context.reply(true)
         stop()
 
+      case UpdateExecutorsLogLevel(logLevel) =>
+        currentLogLevel = Some(logLevel)
+        logInfo(s"Asking each executor to refresh the log level to $logLevel")
+        for ((_, executorData) <- executorDataMap) {
+          executorData.executorEndpoint.send(UpdateExecutorLogLevel(logLevel))
+        }
+        context.reply(true)
+
       case StopExecutors =>
         logInfo("Asking each executor to shut down")
         for ((_, executorData) <- executorDataMap) {
@@ -345,7 +357,8 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
           sparkProperties,
           SparkEnv.get.securityManager.getIOEncryptionKey(),
           Option(delegationTokens.get()),
-          rp)
+          rp,
+          currentLogLevel)
         context.reply(reply)
 
       case IsExecutorAlive(executorId) => context.reply(isExecutorActive(executorId))
@@ -650,6 +663,12 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
     } catch {
       case e: Exception =>
         throw SparkCoreErrors.stopStandaloneSchedulerDriverEndpointError(e)
+    }
+  }
+
+  override def updateExecutorsLogLevel(logLevel: String): Unit = {
+    if (driverEndpoint != null) {
+      driverEndpoint.ask[Boolean](UpdateExecutorsLogLevel(logLevel))
     }
   }
 
@@ -1058,6 +1077,16 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
     CoarseGrainedSchedulerBackend.this.synchronized { fn }
   }
 
+  override def getTaskThreadDump(
+      taskId: Long,
+      executorId: String): Option[ThreadStackTrace] = withLock {
+    if (isExecutorActive(executorId)) {
+      val executorData = executorDataMap(executorId)
+      executorData.executorEndpoint.askSync[Option[ThreadStackTrace]](TaskThreadDump(taskId))
+    } else {
+      None
+    }
+  }
 }
 
 private[spark] object CoarseGrainedSchedulerBackend {

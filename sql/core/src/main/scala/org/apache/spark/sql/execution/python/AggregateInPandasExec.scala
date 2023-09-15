@@ -30,8 +30,8 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
 import org.apache.spark.sql.execution.{GroupedIterator, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.aggregate.UpdatingSessionsIterator
+import org.apache.spark.sql.execution.python.EvalPythonExec.ArgumentMetadata
 import org.apache.spark.sql.types.{DataType, StructField, StructType}
-import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.util.Utils
 
 /**
@@ -102,7 +102,7 @@ case class AggregateInPandasExec(
 
     val sessionLocalTimeZone = conf.sessionLocalTimeZone
     val largeVarTypes = conf.arrowUseLargeVarTypes
-    val pythonRunnerConf = ArrowUtils.getPythonRunnerConfMap(conf)
+    val pythonRunnerConf = ArrowPythonRunner.getPythonRunnerConfMap(conf)
 
     val (pyFuncs, inputs) = udfExpressions.map(collectFunctions).unzip
 
@@ -110,14 +110,20 @@ case class AggregateInPandasExec(
     // Also eliminate duplicate UDF inputs.
     val allInputs = new ArrayBuffer[Expression]
     val dataTypes = new ArrayBuffer[DataType]
-    val argOffsets = inputs.map { input =>
+    val argMetas = inputs.map { input =>
       input.map { e =>
-        if (allInputs.exists(_.semanticEquals(e))) {
-          allInputs.indexWhere(_.semanticEquals(e))
+        val (key, value) = e match {
+          case NamedArgumentExpression(key, value) =>
+            (Some(key), value)
+          case _ =>
+            (None, e)
+        }
+        if (allInputs.exists(_.semanticEquals(value))) {
+          ArgumentMetadata(allInputs.indexWhere(_.semanticEquals(value)), key)
         } else {
-          allInputs += e
-          dataTypes += e.dataType
-          allInputs.length - 1
+          allInputs += value
+          dataTypes += value.dataType
+          ArgumentMetadata(allInputs.length - 1, key)
         }
       }.toArray
     }.toArray
@@ -165,10 +171,10 @@ case class AggregateInPandasExec(
         rows
       }
 
-      val columnarBatchIter = new ArrowPythonRunner(
+      val columnarBatchIter = new ArrowPythonWithNamedArgumentRunner(
         pyFuncs,
         PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
-        argOffsets,
+        argMetas,
         aggInputSchema,
         sessionLocalTimeZone,
         largeVarTypes,

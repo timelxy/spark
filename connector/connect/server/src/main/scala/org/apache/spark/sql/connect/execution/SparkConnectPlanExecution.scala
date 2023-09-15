@@ -70,7 +70,6 @@ private[execution] class SparkConnectPlanExecution(executeHolder: ExecuteHolder)
     if (dataframe.queryExecution.observedMetrics.nonEmpty) {
       responseObserver.onNext(createObservedMetricsResponse(request.getSessionId, dataframe))
     }
-    responseObserver.onCompleted()
   }
 
   type Batch = (Array[Byte], Long)
@@ -125,7 +124,7 @@ private[execution] class SparkConnectPlanExecution(executeHolder: ExecuteHolder)
 
     dataframe.queryExecution.executedPlan match {
       case LocalTableScanExec(_, rows) =>
-        executePlan.eventsManager.postFinished()
+        executePlan.eventsManager.postFinished(Some(rows.length))
         converter(rows.iterator).foreach { case (bytes, count) =>
           sendBatch(bytes, count)
         }
@@ -141,6 +140,8 @@ private[execution] class SparkConnectPlanExecution(executeHolder: ExecuteHolder)
 
             val signal = new Object
             val partitions = new Array[Array[Batch]](numPartitions)
+            var numFinishedPartitions = 0
+            var totalNumRows: Long = 0
             var error: Option[Throwable] = None
 
             // This callback is executed by the DAGScheduler thread.
@@ -149,6 +150,12 @@ private[execution] class SparkConnectPlanExecution(executeHolder: ExecuteHolder)
             val resultHandler = (partitionId: Int, partition: Array[Batch]) => {
               signal.synchronized {
                 partitions(partitionId) = partition
+                totalNumRows += partition.map(_._2).sum
+                numFinishedPartitions += 1
+                if (numFinishedPartitions == numPartitions) {
+                  // Execution is finished, when all partitions returned results.
+                  executePlan.eventsManager.postFinished(Some(totalNumRows))
+                }
                 signal.notify()
               }
               ()
@@ -163,8 +170,7 @@ private[execution] class SparkConnectPlanExecution(executeHolder: ExecuteHolder)
                 resultFunc = () => ())
               // Collect errors and propagate them to the main thread.
               .andThen {
-                case Success(_) =>
-                  executePlan.eventsManager.postFinished()
+                case Success(_) => // do nothing
                 case Failure(throwable) =>
                   signal.synchronized {
                     error = Some(throwable)
@@ -202,7 +208,7 @@ private[execution] class SparkConnectPlanExecution(executeHolder: ExecuteHolder)
             }
             ThreadUtils.awaitReady(future, Duration.Inf)
           } else {
-            executePlan.eventsManager.postFinished()
+            executePlan.eventsManager.postFinished(Some(0))
           }
         }
     }

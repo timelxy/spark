@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 from pyspark.sql.connect.utils import check_dependencies
+from pyspark.sql.utils import is_timestamp_ntz_preferred
 
 check_dependencies(__name__)
 
@@ -295,6 +296,8 @@ class LiteralExpression(Expression):
             return StringType()
         elif isinstance(value, decimal.Decimal):
             return DecimalType()
+        elif isinstance(value, datetime.datetime) and is_timestamp_ntz_preferred():
+            return TimestampNTZType()
         elif isinstance(value, datetime.datetime):
             return TimestampType()
         elif isinstance(value, datetime.date):
@@ -482,6 +485,40 @@ class ColumnReference(Expression):
             other is not None
             and isinstance(other, ColumnReference)
             and other._unparsed_identifier == self._unparsed_identifier
+        )
+
+
+class GetColumnByOrdinal(Expression):
+    """Represents a column index (0-based). There is no guarantee that this column
+    actually exists. In the context of this project, we refer by its index and
+    treat it as an unresolved GetColumnByOrdinal"""
+
+    def __init__(self, ordinal: int, plan_id: Optional[int] = None):
+        super().__init__()
+
+        assert isinstance(ordinal, int) and ordinal >= 0
+        self._ordinal = ordinal
+
+        assert plan_id is None or isinstance(plan_id, int)
+        self._plan_id = plan_id
+
+    def to_plan(self, session: "SparkConnectClient") -> proto.Expression:
+        """Returns the Proto representation of the expression."""
+        expr = proto.Expression()
+        expr.get_column_by_ordinal.ordinal = self._ordinal
+        if self._plan_id is not None:
+            expr.get_column_by_ordinal.plan_id = self._plan_id
+        return expr
+
+    def __repr__(self) -> str:
+        return f"getcolumnbyordinal({self._ordinal})"
+
+    def __eq__(self, other: Any) -> bool:
+        return (
+            other is not None
+            and isinstance(other, GetColumnByOrdinal)
+            and other._ordinal == self._ordinal
+            and other._plan_id == self._plan_id
         )
 
 
@@ -1027,3 +1064,47 @@ class DistributedSequenceID(Expression):
 
     def __repr__(self) -> str:
         return "DistributedSequenceID()"
+
+
+class CallFunction(Expression):
+    def __init__(self, name: str, args: Sequence["Expression"]):
+        super().__init__()
+
+        assert isinstance(name, str)
+        self._name = name
+
+        assert isinstance(args, list) and all(isinstance(arg, Expression) for arg in args)
+        self._args = args
+
+    def to_plan(self, session: "SparkConnectClient") -> "proto.Expression":
+        expr = proto.Expression()
+        expr.call_function.function_name = self._name
+        if len(self._args) > 0:
+            expr.call_function.arguments.extend([arg.to_plan(session) for arg in self._args])
+        return expr
+
+    def __repr__(self) -> str:
+        if len(self._args) > 0:
+            return f"CallFunction('{self._name}', {', '.join([str(arg) for arg in self._args])})"
+        else:
+            return f"CallFunction('{self._name}')"
+
+
+class NamedArgumentExpression(Expression):
+    def __init__(self, key: str, value: Expression):
+        super().__init__()
+
+        assert isinstance(key, str)
+        self._key = key
+
+        assert isinstance(value, Expression)
+        self._value = value
+
+    def to_plan(self, session: "SparkConnectClient") -> "proto.Expression":
+        expr = proto.Expression()
+        expr.named_argument_expression.key = self._key
+        expr.named_argument_expression.value.CopyFrom(self._value.to_plan(session))
+        return expr
+
+    def __repr__(self) -> str:
+        return f"{self._key} => {self._value}"

@@ -29,7 +29,6 @@ import org.apache.spark.{SparkException, SparkRuntimeException}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Literal, StructsToJson}
 import org.apache.spark.sql.catalyst.expressions.Cast._
-import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -541,7 +540,7 @@ class JsonFunctionsSuite extends QueryTest with SharedSparkSession {
     )
 
     checkError(
-      exception = intercept[ParseException] {
+      exception = intercept[AnalysisException] {
         df3.selectExpr("""from_json(value, 'time InvalidType')""")
       },
       errorClass = "PARSE_SYNTAX_ERROR",
@@ -1022,16 +1021,23 @@ class JsonFunctionsSuite extends QueryTest with SharedSparkSession {
       .add("c2", ArrayType(new StructType().add("c3", LongType).add("c4", StringType)))
     val df1 = Seq("""{"c2": [19], "c1": 123456}""").toDF("c0")
     checkAnswer(df1.select(from_json($"c0", st)), Row(Row(123456, null)))
-    val df2 = Seq("""{"data": {"c2": [19], "c1": 123456}}""").toDF("c0")
-    checkAnswer(df2.select(from_json($"c0", new StructType().add("data", st))), Row(Row(null)))
 
+    val df2 = Seq("""{"data": {"c2": [19], "c1": 123456}}""").toDF("c0")
     withSQLConf(SQLConf.JSON_ENABLE_PARTIAL_RESULTS.key -> "true") {
-      val df3 = Seq("""[{"c2": [19], "c1": 123456}]""").toDF("c0")
-      checkAnswer(df3.select(from_json($"c0", ArrayType(st))), Row(Array(Row(123456, null))))
+      checkAnswer(
+        df2.select(from_json($"c0", new StructType().add("data", st))),
+        Row(Row(Row(123456, null)))
+      )
+    }
+    withSQLConf(SQLConf.JSON_ENABLE_PARTIAL_RESULTS.key -> "false") {
+      checkAnswer(df2.select(from_json($"c0", new StructType().add("data", st))), Row(Row(null)))
     }
 
+    val df3 = Seq("""[{"c2": [19], "c1": 123456}]""").toDF("c0")
+    withSQLConf(SQLConf.JSON_ENABLE_PARTIAL_RESULTS.key -> "true") {
+      checkAnswer(df3.select(from_json($"c0", ArrayType(st))), Row(Array(Row(123456, null))))
+    }
     withSQLConf(SQLConf.JSON_ENABLE_PARTIAL_RESULTS.key -> "false") {
-      val df3 = Seq("""[{"c2": [19], "c1": 123456}]""").toDF("c0")
       checkAnswer(df3.select(from_json($"c0", ArrayType(st))), Row(null))
     }
 
@@ -1120,14 +1126,13 @@ class JsonFunctionsSuite extends QueryTest with SharedSparkSession {
         )
       )
 
-    // Value "a" cannot be parsed as an integer,
-    // the error cascades to "c2", thus making its value null.
+    // Value "a" cannot be parsed as an integer, c2 value is null.
     val df = Seq("""[{"c1": [{"c2": ["a"]}]}]""").toDF("c0")
 
     withSQLConf(SQLConf.JSON_ENABLE_PARTIAL_RESULTS.key -> "true") {
       checkAnswer(
         df.select(from_json($"c0", ArrayType(st))),
-        Row(Array(Row(null)))
+        Row(Array(Row(Seq(Row(null)))))
       )
     }
 
@@ -1151,7 +1156,7 @@ class JsonFunctionsSuite extends QueryTest with SharedSparkSession {
     val invalidJsonSchema = """{"fields": [{"a":123}], "type": "struct"}"""
     val invalidJsonSchemaReason = "Failed to convert the JSON string '{\"a\":123}' to a field."
     checkError(
-      exception = intercept[SparkException] {
+      exception = intercept[AnalysisException] {
         df.select(from_json($"json", invalidJsonSchema, Map.empty[String, String])).collect()
       },
       errorClass = "INVALID_SCHEMA.PARSE_ERROR",
@@ -1166,7 +1171,7 @@ class JsonFunctionsSuite extends QueryTest with SharedSparkSession {
       "was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')\n " +
       "at [Source: (String)\"MAP<INT, cow>\"; line: 1, column: 4]"
     checkError(
-      exception = intercept[SparkException] {
+      exception = intercept[AnalysisException] {
         df.select(from_json($"json", invalidDataType, Map.empty[String, String])).collect()
       },
       errorClass = "INVALID_SCHEMA.PARSE_ERROR",
@@ -1181,7 +1186,7 @@ class JsonFunctionsSuite extends QueryTest with SharedSparkSession {
       "was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')\n" +
       " at [Source: (String)\"x INT, a cow\"; line: 1, column: 2]"
     checkError(
-      exception = intercept[SparkException] {
+      exception = intercept[AnalysisException] {
         df.select(from_json($"json", invalidTableSchema, Map.empty[String, String])).collect()
       },
       errorClass = "INVALID_SCHEMA.PARSE_ERROR",

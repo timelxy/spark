@@ -106,9 +106,20 @@ abstract class JdbcDialect extends Serializable with Logging {
   def getJDBCType(dt: DataType): Option[JdbcType] = None
 
   /**
+   * Converts an instance of `java.sql.Timestamp` to a custom `java.sql.Timestamp` value.
+   * @param t represents a specific instant in time based on
+   *          the hybrid calendar which combines Julian and
+   *          Gregorian calendars.
+   * @return the timestamp value to convert to
+   * @throws IllegalArgumentException if t is null
+   */
+  @Since("3.5.0")
+  def convertJavaTimestampToTimestamp(t: Timestamp): Timestamp = t
+
+  /**
    * Convert java.sql.Timestamp to a LocalDateTime representing the same wall-clock time as the
    * value stored in a remote database.
-   * JDBC dialects should override this function to provide implementations that suite their
+   * JDBC dialects should override this function to provide implementations that suit their
    * JDBC drivers.
    * @param t Timestamp returned from JDBC driver getTimestamp method.
    * @return A LocalDateTime representing the same wall clock time as the timestamp in database.
@@ -691,6 +702,8 @@ object JdbcDialects {
   registerDialect(OracleDialect)
   registerDialect(TeradataDialect)
   registerDialect(H2Dialect)
+  registerDialect(SnowflakeDialect)
+  registerDialect(DatabricksDialect)
 
   /**
    * Fetch the JdbcDialect class corresponding to a given database url.
@@ -708,6 +721,6 @@ object JdbcDialects {
 /**
  * NOOP dialect object, always returning the neutral element.
  */
-object NoopDialect extends JdbcDialect {
+private[spark] object NoopDialect extends JdbcDialect {
   override def canHandle(url : String): Boolean = true
 }

@@ -42,6 +42,7 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.*;
 import org.apache.spark.sql.*;
+import static org.apache.spark.sql.RowFactory.create;
 import org.apache.spark.sql.catalyst.encoders.OuterScopes;
 import org.apache.spark.sql.catalyst.expressions.GenericRow;
 import org.apache.spark.sql.test.TestSparkSession;
@@ -1782,6 +1783,23 @@ public class JavaDatasetSuite implements Serializable {
     Assert.assertEquals(1, df.collectAsList().size());
   }
 
+  public static class ReadOnlyPropertyBean implements Serializable {
+      public boolean isEmpty() {
+        return true;
+      }
+  }
+
+  @Test
+  public void testReadOnlyPropertyBean() {
+    ReadOnlyPropertyBean bean = new ReadOnlyPropertyBean();
+    List<ReadOnlyPropertyBean> data = Arrays.asList(bean);
+    Dataset<ReadOnlyPropertyBean> df = spark.createDataset(data,
+            Encoders.bean(ReadOnlyPropertyBean.class));
+    Assert.assertEquals(1, df.schema().length());
+    Assert.assertEquals(1, df.collectAsList().size());
+
+  }
+
   public class CircularReference1Bean implements Serializable {
     private CircularReference2Bean child;
 
@@ -1954,6 +1972,24 @@ public class JavaDatasetSuite implements Serializable {
     Dataset<SpecificListsBean> dataset =
       spark.createDataset(beans, Encoders.bean(SpecificListsBean.class));
     Assert.assertEquals(beans, dataset.collectAsList());
+  }
+
+  @Test
+  public void testRowEncoder() {
+    final StructType schema = new StructType()
+        .add("a", "int")
+        .add("b", "string");
+    final Dataset<Row> df = spark.range(3)
+        .map(new MapFunction<Long, Row>() {
+               @Override
+               public Row call(Long i) {
+                 return create(i.intValue(), "s" + i);
+               }
+             },
+            Encoders.row(schema))
+        .filter(col("a").geq(1));
+    final List<Row> expected = Arrays.asList(create(1, "s1"), create(2, "s2"));
+    Assert.assertEquals(expected, df.collectAsList());
   }
 
   public static class SpecificListsBean implements Serializable {

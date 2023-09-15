@@ -53,13 +53,17 @@ import org.apache.spark.unsafe.types.{ByteArray, UTF8String}
  */
 // scalastyle:off line.size.limit
 @ExpressionDescription(
-  usage = "_FUNC_(sep[, str | array(str)]+) - Returns the concatenation of the strings separated by `sep`.",
+  usage = "_FUNC_(sep[, str | array(str)]+) - Returns the concatenation of the strings separated by `sep`, skipping null values.",
   examples = """
     Examples:
       > SELECT _FUNC_(' ', 'Spark', 'SQL');
         Spark SQL
       > SELECT _FUNC_('s');
 
+      > SELECT _FUNC_('/', 'foo', null, 'bar');
+        foo/bar
+      > SELECT _FUNC_(null, 'Spark', 'SQL');
+        NULL
   """,
   since = "1.5.0",
   group = "string_funcs")
@@ -2779,7 +2783,7 @@ case class ToBinary(
           DataTypeMismatch(
             errorSubClass = "NON_FOLDABLE_INPUT",
             messageParameters = Map(
-              "inputName" -> "fmt",
+              "inputName" -> toSQLId("fmt"),
               "inputType" -> toSQLType(StringType),
               "inputExpr" -> toSQLExpr(f)
             )
